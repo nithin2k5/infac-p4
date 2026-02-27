@@ -3,7 +3,7 @@ InFac P4 — Industrial Inspection System
 Entry point for the desktop application.
 
 Requirements:
-    pip install opencv-python Pillow
+    pip install opencv-python Pillow requests
 """
 
 import sys
@@ -20,6 +20,10 @@ def check_dependencies():
         from PIL import Image, ImageTk
     except ImportError:
         missing.append("Pillow")
+    try:
+        import requests
+    except ImportError:
+        missing.append("requests")
 
     if missing:
         print(f"Missing dependencies: {', '.join(missing)}")

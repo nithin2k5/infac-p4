@@ -1,18 +1,30 @@
 """
 InFac P4 — Industrial Inspection System
-Single-page live camera detection application using OpenCV + Tkinter.
+Single-page live camera detection application using OpenCV + Tkinter + Roboflow.
 """
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog
 import cv2
 import numpy as np
 import time
 import threading
+import base64
+import requests
+import io
 from PIL import Image, ImageTk
 from datetime import datetime
 from ui.theme import Colors, Fonts, Dimensions, configure_styles
 from ui.components import StyledButton, ToggleSwitch
+
+
+# ═════════════════════════════════════════════════════════
+#  ROBOFLOW CONFIGURATION
+# ═════════════════════════════════════════════════════════
+
+ROBOFLOW_API_KEY = "E0ydCq2X9PG3cJwSAUyb"
+ROBOFLOW_MODEL = "p4-fiyhn/1"
+ROBOFLOW_URL = f"https://detect.roboflow.com/{ROBOFLOW_MODEL}"
 
 
 class InFacApp(tk.Tk):
@@ -50,13 +62,19 @@ class InFacApp(tk.Tk):
         self.fps = 0.0
         self.last_fps_time = time.time()
         self.fps_frame_count = 0
-        self.detections = []
-        self.detection_log = []
+        self.current_detections = []       # latest detections from Roboflow
+        self.detection_log_items = []      # log widgets in right panel
         self.total_inspected = 0
         self.total_defects = 0
+        self.all_confidences = []          # for avg confidence calc
         self.confidence_threshold = 0.65
         self.current_frame = None
-        self._photo_ref = None  # prevent GC
+        self._photo_ref = None             # prevent GC
+        self._inference_lock = threading.Lock()
+        self._inference_busy = False       # throttle: one request at a time
+        self._detect_interval = 0          # frame counter for inference spacing
+        self._inference_fps = 0.0
+        self._last_inference_time = 0
 
         # ── Build UI ─────────────────────────────────────
         self._build_ui()
@@ -129,7 +147,6 @@ class InFacApp(tk.Tk):
 
     def _build_camera_section(self, parent):
         """Camera feed area with header."""
-        # Header
         cam_header = tk.Frame(parent, bg=Colors.BG_DARK)
         cam_header.pack(fill="x", pady=(0, 8))
 
@@ -151,7 +168,6 @@ class InFacApp(tk.Tk):
                                      bg=Colors.BG_DARK, fg=Colors.TEXT_MUTED)
         self.frame_label.pack(side="left")
 
-        # Camera canvas
         cam_container = tk.Frame(parent, bg="#0a0a0a", highlightbackground=Colors.BORDER,
                                   highlightthickness=1)
         cam_container.pack(fill="both", expand=True)
@@ -159,8 +175,6 @@ class InFacApp(tk.Tk):
         self.camera_canvas = tk.Canvas(cam_container, bg="#0a0a0a",
                                         highlightthickness=0, cursor="crosshair")
         self.camera_canvas.pack(fill="both", expand=True)
-
-        # Draw initial placeholder
         self.camera_canvas.bind("<Configure>", self._draw_placeholder)
 
     def _build_controls_bar(self, parent):
@@ -189,14 +203,19 @@ class InFacApp(tk.Tk):
             command=self._capture_frame, font=Fonts.BUTTON).pack(side="left", padx=4)
 
         StyledButton(
-            inner, text="🔄  Reset Stats", bg_color=Colors.BG_CARD,
+            inner, text="�️  Upload Image", bg_color=Colors.BG_CARD,
+            hover_color=Colors.BG_CARD_HOVER, width=150, height=40,
+            command=self._upload_image, font=Fonts.BUTTON).pack(side="left", padx=4)
+
+        StyledButton(
+            inner, text="�🔄  Reset Stats", bg_color=Colors.BG_CARD,
             hover_color=Colors.BG_CARD_HOVER, width=130, height=40,
             command=self._reset_stats, font=Fonts.BUTTON).pack(side="left", padx=4)
 
     def _build_stats_row(self, parent):
         """Stats cards row below controls."""
         stats = tk.Frame(parent, bg=Colors.BG_DARK)
-        stats.pack(fill="x", pady=(0, 0))
+        stats.pack(fill="x")
 
         cards_data = [
             ("🔬", "Total Inspected", "total_inspected_val", "0", Colors.PRIMARY),
@@ -265,18 +284,26 @@ class InFacApp(tk.Tk):
         self.cam_combo.set("Camera 0")
         self.cam_combo.pack(fill="x", pady=(4, 0))
 
-        # Toggles
-        toggles = [("Show Bounding Boxes", True), ("Show Confidence", True),
-                    ("Show Grid Overlay", False), ("Auto-capture Defects", False)]
-        for label, initial in toggles:
-            row = tk.Frame(parent, bg=Colors.BG_CARD)
-            row.pack(fill="x", padx=16, pady=3)
-            tk.Label(row, text=label, font=Fonts.SMALL,
-                     bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY).pack(side="left")
-            ToggleSwitch(row, initial=initial, bg=Colors.BG_CARD).pack(side="right")
+        # Model info
+        sep0 = tk.Frame(parent, bg=Colors.BORDER, height=1)
+        sep0.pack(fill="x", padx=16, pady=8)
+
+        tk.Label(parent, text="🤖  Model", font=Fonts.SMALL_BOLD,
+                 bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY).pack(anchor="w", padx=16)
+
+        model_info = tk.Frame(parent, bg=Colors.BG_CARD)
+        model_info.pack(fill="x", padx=16, pady=(4, 4))
+        for key, val in [("Endpoint", "Roboflow Hosted API"),
+                         ("Model", ROBOFLOW_MODEL)]:
+            row = tk.Frame(model_info, bg=Colors.BG_CARD)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=key, font=Fonts.TINY, bg=Colors.BG_CARD,
+                     fg=Colors.TEXT_MUTED).pack(side="left")
+            tk.Label(row, text=val, font=Fonts.TINY, bg=Colors.BG_CARD,
+                     fg=Colors.TEXT_PRIMARY).pack(side="right")
 
         # Separator
-        tk.Frame(parent, bg=Colors.BORDER, height=1).pack(fill="x", padx=16, pady=12)
+        tk.Frame(parent, bg=Colors.BORDER, height=1).pack(fill="x", padx=16, pady=8)
 
         # ── Detection Log ────────────────────────────────
         log_header = tk.Frame(parent, bg=Colors.BG_CARD)
@@ -287,7 +314,6 @@ class InFacApp(tk.Tk):
                                          bg=Colors.BG_CARD, fg=Colors.TEXT_MUTED)
         self.log_count_label.pack(side="right")
 
-        # Scrollable log
         log_container = tk.Frame(parent, bg=Colors.BG_CARD)
         log_container.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
@@ -305,9 +331,8 @@ class InFacApp(tk.Tk):
         self.log_canvas.pack(side="left", fill="both", expand=True)
         log_scrollbar.pack(side="right", fill="y")
 
-        # Empty state
         self.empty_label = tk.Label(self.log_frame,
-                                     text="No detections yet.\nStart the camera and detection\nto see results here.",
+                                     text="No detections yet.\nStart camera & detection\nto see results here.",
                                      font=Fonts.SMALL, bg=Colors.BG_CARD,
                                      fg=Colors.TEXT_MUTED, justify="center")
         self.empty_label.pack(pady=40)
@@ -330,22 +355,26 @@ class InFacApp(tk.Tk):
             self.cam_status_label.configure(text="● Camera Error", fg=Colors.DANGER)
             return
 
+        # Clear any uploaded image state
+        self._static_frame = None
+        self._static_predictions = []
+        self.camera_canvas.unbind("<Configure>")
+
         self.is_running = True
         self.cam_status_label.configure(text="● Camera Connected", fg=Colors.SUCCESS)
 
-        # Update button text
         self.start_btn.itemconfig(self.start_btn._text_id, text="⏹  Stop Camera")
         self.start_btn.bg_color = Colors.DANGER_DIM
         self.start_btn.hover_color = Colors.DANGER
         self.start_btn.itemconfig(self.start_btn._bg_id, fill=Colors.DANGER_DIM)
 
-        # Get resolution
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.res_label.configure(text=f"{w} × {h}")
 
         self.last_fps_time = time.time()
         self.fps_frame_count = 0
+        self._detect_interval = 0
         self._update_frame()
 
     def _stop_camera(self):
@@ -371,6 +400,7 @@ class InFacApp(tk.Tk):
         self.fps_label.configure(text="FPS: --")
         self.frame_label.configure(text="Frame: 0")
         self.frame_count = 0
+        self.current_detections = []
 
         self.camera_canvas.delete("all")
         self.camera_canvas.bind("<Configure>", self._draw_placeholder)
@@ -401,33 +431,76 @@ class InFacApp(tk.Tk):
 
         self.frame_label.configure(text=f"Frame: {self.frame_count:,}")
 
-        # TODO: Run detection through Roboflow here when integrated
-        # For now, just display the frame
+        # ── Trigger Roboflow inference ───────────────────
+        if self.is_detecting:
+            self._detect_interval += 1
+            # Send every 10th frame to avoid flooding the API
+            if self._detect_interval >= 10 and not self._inference_busy:
+                self._detect_interval = 0
+                self._run_inference_async(frame.copy())
+
+        # ── Draw frame with detection overlays ───────────
         display_frame = frame.copy()
 
-        # Add overlay info
         if self.is_detecting:
-            # Draw crosshair at center
-            h, w = display_frame.shape[:2]
-            cx, cy = w // 2, h // 2
-            cv2.line(display_frame, (cx - 20, cy), (cx + 20, cy), (88, 166, 255), 1)
-            cv2.line(display_frame, (cx, cy - 20), (cx, cy + 20), (88, 166, 255), 1)
+            h_frame, w_frame = display_frame.shape[:2]
 
-            # Timestamp overlay
+            # Draw bounding boxes from latest detections
+            with self._inference_lock:
+                dets = list(self.current_detections)
+
+            for det in dets:
+                x1 = int(det["x"] - det["width"] / 2)
+                y1 = int(det["y"] - det["height"] / 2)
+                x2 = int(det["x"] + det["width"] / 2)
+                y2 = int(det["y"] + det["height"] / 2)
+                conf = det["confidence"]
+                cls_name = det["class"]
+
+                # Vivid colors for visibility
+                if conf >= 0.8:
+                    color_bgr = (0, 255, 0)       # bright green
+                elif conf >= 0.5:
+                    color_bgr = (0, 255, 255)     # bright yellow
+                else:
+                    color_bgr = (0, 0, 255)       # bright red
+
+                # Thick bounding box
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color_bgr, 3)
+
+                # Bold corner accents
+                corner_len = min(20, min(x2-x1, y2-y1) // 3)
+                for cx, cy, dx, dy in [(x1, y1, 1, 1), (x2, y1, -1, 1),
+                                        (x1, y2, 1, -1), (x2, y2, -1, -1)]:
+                    cv2.line(display_frame, (cx, cy), (cx + corner_len*dx, cy), color_bgr, 4)
+                    cv2.line(display_frame, (cx, cy), (cx, cy + corner_len*dy), color_bgr, 4)
+
+                # Large label background + text
+                label_text = f"{cls_name} {conf:.0%}"
+                (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                cv2.rectangle(display_frame, (x1, y1 - th - 14), (x1 + tw + 14, y1), color_bgr, -1)
+                cv2.putText(display_frame, label_text, (x1 + 7, y1 - 7),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
+
+            # Crosshair
+            cx, cy = w_frame // 2, h_frame // 2
+            cv2.line(display_frame, (cx-20, cy), (cx+20, cy), (88, 166, 255), 1)
+            cv2.line(display_frame, (cx, cy-20), (cx, cy+20), (88, 166, 255), 1)
+
+            # Timestamp
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            cv2.putText(display_frame, ts, (10, h - 15),
+            cv2.putText(display_frame, ts, (10, h_frame - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (138, 148, 158), 1)
 
-            # Detection mode indicator
-            cv2.circle(display_frame, (w - 30, 25), 8, (0, 0, 255), -1)
-            cv2.putText(display_frame, "DETECTING", (w - 130, 30),
+            # DETECTING indicator
+            cv2.circle(display_frame, (w_frame - 30, 25), 8, (0, 0, 255), -1)
+            cv2.putText(display_frame, "DETECTING", (w_frame - 130, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-        # Convert BGR → RGB → Tkinter PhotoImage
+        # Convert to Tkinter image
         rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
 
-        # Resize to fit canvas
         canvas_w = self.camera_canvas.winfo_width()
         canvas_h = self.camera_canvas.winfo_height()
         if canvas_w > 10 and canvas_h > 10:
@@ -437,12 +510,118 @@ class InFacApp(tk.Tk):
             img = img.resize((new_w, new_h), Image.LANCZOS)
 
         photo = ImageTk.PhotoImage(image=img)
-        self._photo_ref = photo  # prevent GC
+        self._photo_ref = photo
         self.camera_canvas.delete("all")
         self.camera_canvas.create_image(canvas_w // 2, canvas_h // 2,
                                          image=photo, anchor="center")
 
         self.after(15, self._update_frame)
+
+    # ═════════════════════════════════════════════════════
+    #  ROBOFLOW INFERENCE
+    # ═════════════════════════════════════════════════════
+
+    def _run_inference_async(self, frame):
+        """Send a frame to Roboflow in a background thread."""
+        self._inference_busy = True
+        thread = threading.Thread(target=self._do_inference, args=(frame,), daemon=True)
+        thread.start()
+
+    def _do_inference(self, frame):
+        """Perform Roboflow API inference (runs in background thread)."""
+        try:
+            # Encode frame as JPEG base64
+            _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            img_base64 = base64.b64encode(buffer).decode("utf-8")
+
+            # POST to Roboflow hosted API
+            params = {
+                "api_key": ROBOFLOW_API_KEY,
+                "confidence": int(self.confidence_threshold * 100),
+            }
+
+            resp = requests.post(
+                ROBOFLOW_URL,
+                params=params,
+                data=img_base64,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=10,
+            )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                predictions = data.get("predictions", [])
+
+                with self._inference_lock:
+                    self.current_detections = predictions
+
+                # Schedule UI update on the main thread
+                self.after(0, self._on_inference_result, predictions)
+            else:
+                self.after(0, lambda: self.model_status_label.configure(
+                    text=f"● API Error ({resp.status_code})", fg=Colors.DANGER))
+
+        except requests.exceptions.Timeout:
+            self.after(0, lambda: self.model_status_label.configure(
+                text="● API Timeout", fg=Colors.WARNING))
+        except requests.exceptions.ConnectionError:
+            self.after(0, lambda: self.model_status_label.configure(
+                text="● Connection Error", fg=Colors.DANGER))
+        except Exception as e:
+            self.after(0, lambda: self.model_status_label.configure(
+                text="● Inference Error", fg=Colors.DANGER))
+        finally:
+            self._inference_busy = False
+
+    def _on_inference_result(self, predictions):
+        """Handle inference results on the main thread — update stats & log."""
+        if not self.is_detecting:
+            return
+
+        self.total_inspected += 1
+        self.stat_labels["total_inspected_val"].configure(text=str(self.total_inspected))
+
+        self.model_status_label.configure(text="● Detecting", fg=Colors.SUCCESS)
+
+        if predictions:
+            for pred in predictions:
+                conf = pred["confidence"]
+                cls_name = pred["class"]
+                self.all_confidences.append(conf)
+
+                # Determine if defect (any class that isn't "pass"/"ok"/"good")
+                is_defect = cls_name.lower() not in ("pass", "ok", "good", "normal")
+                if is_defect:
+                    self.total_defects += 1
+                    color = Colors.DANGER
+                else:
+                    color = Colors.SUCCESS
+
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                self._add_log_entry(
+                    cls_name.capitalize(),
+                    timestamp,
+                    color,
+                    f"{conf:.0%}"
+                )
+        else:
+            # No detections = pass
+            self.all_confidences.append(1.0)
+
+        # Update stats
+        self.stat_labels["defects_val"].configure(text=str(self.total_defects))
+
+        if self.total_inspected > 0:
+            pass_rate = (1 - self.total_defects / self.total_inspected) * 100
+            self.stat_labels["pass_rate_val"].configure(text=f"{pass_rate:.1f}%")
+
+        if self.all_confidences:
+            avg_conf = sum(self.all_confidences) / len(self.all_confidences)
+            self.stat_labels["avg_conf_val"].configure(text=f"{avg_conf:.1%}")
+
+    # ═════════════════════════════════════════════════════
+    #  CONTROLS
+    # ═════════════════════════════════════════════════════
 
     def _toggle_detection(self):
         if not self.is_running:
@@ -456,25 +635,167 @@ class InFacApp(tk.Tk):
             self.detect_btn.bg_color = Colors.WARNING_DIM
             self.detect_btn.hover_color = Colors.WARNING
             self.detect_btn.itemconfig(self.detect_btn._bg_id, fill=Colors.WARNING_DIM)
+            self._detect_interval = 0
         else:
             self.model_status_label.configure(text="● Model Paused", fg=Colors.WARNING)
             self.detect_btn.itemconfig(self.detect_btn._text_id, text="🔍  Start Detection")
             self.detect_btn.bg_color = Colors.PRIMARY_DIM
             self.detect_btn.hover_color = Colors.PRIMARY
             self.detect_btn.itemconfig(self.detect_btn._bg_id, fill=Colors.PRIMARY_DIM)
+            with self._inference_lock:
+                self.current_detections = []
+
+    def _upload_image(self):
+        """Open a file dialog to upload an image for detection testing."""
+        filetypes = [("Image files", "*.jpg *.jpeg *.png *.bmp *.webp"), ("All files", "*.*")]
+        filepath = filedialog.askopenfilename(title="Select Image for Detection",
+                                              filetypes=filetypes)
+        if not filepath:
+            return
+
+        # Stop live camera if running
+        if self.is_running:
+            self._stop_camera()
+
+        # Load image
+        frame = cv2.imread(filepath)
+        if frame is None:
+            self.model_status_label.configure(text="● Failed to load image", fg=Colors.DANGER)
+            return
+
+        self.current_frame = frame.copy()
+        self._static_frame = frame.copy()       # store for resize redraw
+        self._static_predictions = []            # store for resize redraw
+
+        # Unbind placeholder so uploaded image persists on resize
+        self.camera_canvas.unbind("<Configure>")
+        self.camera_canvas.bind("<Configure>", self._redraw_static)
+
+        # Show image dimensions
+        h_img, w_img = frame.shape[:2]
+        self.res_label.configure(text=f"{w_img} × {h_img}")
+        self.cam_status_label.configure(text="● Image Loaded", fg=Colors.PRIMARY)
+        self.model_status_label.configure(text="● Running inference...", fg=Colors.WARNING)
+        self.update_idletasks()
+
+        # Display the image immediately (no detections yet)
+        self._display_static_frame(frame.copy(), [])
+
+        # Run inference
+        try:
+            _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            img_base64 = base64.b64encode(buffer).decode("utf-8")
+
+            params = {
+                "api_key": ROBOFLOW_API_KEY,
+                "confidence": int(self.confidence_threshold * 100),
+            }
+            resp = requests.post(
+                ROBOFLOW_URL, params=params, data=img_base64,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=15,
+            )
+
+            if resp.status_code == 200:
+                predictions = resp.json().get("predictions", [])
+                self._static_predictions = predictions  # store for resize redraw
+                self._display_static_frame(frame.copy(), predictions)
+                self.model_status_label.configure(text=f"● {len(predictions)} detection(s)", fg=Colors.SUCCESS)
+
+                # Log results
+                filename = filepath.replace("/", "\\").split("\\")[-1]
+                self.total_inspected += 1
+                self.stat_labels["total_inspected_val"].configure(text=str(self.total_inspected))
+                for pred in predictions:
+                    conf = pred["confidence"]
+                    cls_name = pred["class"]
+                    self.all_confidences.append(conf)
+                    is_defect = cls_name.lower() not in ("pass", "ok", "good", "normal")
+                    if is_defect:
+                        self.total_defects += 1
+                    self._add_log_entry(
+                        cls_name.capitalize(),
+                        f"Image: {filename}",
+                        Colors.DANGER if is_defect else Colors.SUCCESS,
+                        f"{conf:.0%}"
+                    )
+                if not predictions:
+                    self._add_log_entry("No detections", filename,
+                                        Colors.TEXT_MUTED, "--")
+
+                # Update stats
+                self.stat_labels["defects_val"].configure(text=str(self.total_defects))
+                if self.total_inspected > 0:
+                    pass_rate = (1 - self.total_defects / self.total_inspected) * 100
+                    self.stat_labels["pass_rate_val"].configure(text=f"{pass_rate:.1f}%")
+                if self.all_confidences:
+                    avg_c = sum(self.all_confidences) / len(self.all_confidences)
+                    self.stat_labels["avg_conf_val"].configure(text=f"{avg_c:.1%}")
+            else:
+                self.model_status_label.configure(
+                    text=f"● API Error ({resp.status_code})", fg=Colors.DANGER)
+        except Exception as e:
+            self.model_status_label.configure(text="● Inference Error", fg=Colors.DANGER)
+
+    def _redraw_static(self, event=None):
+        """Redraw the uploaded image on canvas resize."""
+        if hasattr(self, '_static_frame') and self._static_frame is not None:
+            self._display_static_frame(self._static_frame.copy(),
+                                        self._static_predictions)
+
+    def _display_static_frame(self, frame, predictions):
+        """Display a static image on the canvas with detection overlays."""
+        for det in predictions:
+            x1 = int(det["x"] - det["width"] / 2)
+            y1 = int(det["y"] - det["height"] / 2)
+            x2 = int(det["x"] + det["width"] / 2)
+            y2 = int(det["y"] + det["height"] / 2)
+            conf = det["confidence"]
+            cls_name = det["class"]
+
+            color_bgr = (0, 255, 0) if conf >= 0.8 else (0, 255, 255) if conf >= 0.5 else (0, 0, 255)
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color_bgr, 3)
+            corner_len = min(20, min(x2-x1, y2-y1) // 3)
+            for cx, cy, dx, dy in [(x1,y1,1,1),(x2,y1,-1,1),(x1,y2,1,-1),(x2,y2,-1,-1)]:
+                cv2.line(frame, (cx, cy), (cx+corner_len*dx, cy), color_bgr, 4)
+                cv2.line(frame, (cx, cy), (cx, cy+corner_len*dy), color_bgr, 4)
+
+            label_text = f"{cls_name} {conf:.0%}"
+            (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(frame, (x1, y1-th-14), (x1+tw+14, y1), color_bgr, -1)
+            cv2.putText(frame, label_text, (x1+7, y1-7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb)
+
+        canvas_w = self.camera_canvas.winfo_width()
+        canvas_h = self.camera_canvas.winfo_height()
+        if canvas_w > 10 and canvas_h > 10:
+            img_w, img_h = img.size
+            scale = min(canvas_w / img_w, canvas_h / img_h)
+            new_w, new_h = int(img_w * scale), int(img_h * scale)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+
+        photo = ImageTk.PhotoImage(image=img)
+        self._photo_ref = photo
+        self.camera_canvas.delete("all")
+        self.camera_canvas.create_image(canvas_w // 2, canvas_h // 2,
+                                         image=photo, anchor="center")
 
     def _capture_frame(self):
         if self.current_frame is not None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"capture_{timestamp}.jpg"
             cv2.imwrite(filename, self.current_frame)
-            self._add_log_entry("📸 Capture", f"Saved: {filename}",
-                                Colors.PRIMARY, "--")
+            self._add_log_entry("📸 Capture", f"Saved: {filename}", Colors.PRIMARY, "--")
 
     def _reset_stats(self):
         self.total_inspected = 0
         self.total_defects = 0
-        self.detection_log.clear()
+        self.all_confidences.clear()
+        self.detection_log_items.clear()
         self.stat_labels["total_inspected_val"].configure(text="0")
         self.stat_labels["defects_val"].configure(text="0")
         self.stat_labels["pass_rate_val"].configure(text="100.0%")
@@ -483,7 +804,7 @@ class InFacApp(tk.Tk):
         for widget in self.log_frame.winfo_children():
             widget.destroy()
         self.empty_label = tk.Label(self.log_frame,
-                                     text="No detections yet.\nStart the camera and detection\nto see results here.",
+                                     text="No detections yet.\nStart camera & detection\nto see results here.",
                                      font=Fonts.SMALL, bg=Colors.BG_CARD,
                                      fg=Colors.TEXT_MUTED, justify="center")
         self.empty_label.pack(pady=40)
@@ -495,7 +816,6 @@ class InFacApp(tk.Tk):
 
     def _add_log_entry(self, label, detail, color, confidence):
         """Add an entry to the detection log panel."""
-        # Remove empty state
         if hasattr(self, 'empty_label') and self.empty_label.winfo_exists():
             self.empty_label.destroy()
 
@@ -518,10 +838,14 @@ class InFacApp(tk.Tk):
         tk.Label(info, text=detail, font=Fonts.TINY,
                  bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED).pack(anchor="w")
 
-        self.detection_log.append(item)
-        self.log_count_label.configure(text=f"{len(self.detection_log)} items")
+        self.detection_log_items.append(item)
+        self.log_count_label.configure(text=f"{len(self.detection_log_items)} items")
 
-        # Auto-scroll to bottom
+        # Keep log manageable — remove oldest if > 100
+        if len(self.detection_log_items) > 100:
+            old = self.detection_log_items.pop(0)
+            old.destroy()
+
         self.log_canvas.update_idletasks()
         self.log_canvas.yview_moveto(1.0)
 
@@ -547,19 +871,15 @@ class InFacApp(tk.Tk):
         if w < 50 or h < 50:
             return
 
-        # Grid
         for x in range(0, w, 40):
             c.create_line(x, 0, x, h, fill="#1a1a2e", width=1)
         for y in range(0, h, 40):
             c.create_line(0, y, w, y, fill="#1a1a2e", width=1)
 
-        # Center icon and text
-        c.create_text(w // 2, h // 2 - 30, text="📷", font=("Segoe UI", 36),
-                      fill=Colors.TEXT_MUTED)
-        c.create_text(w // 2, h // 2 + 20, text="Camera feed will appear here",
+        c.create_text(w//2, h//2 - 30, text="📷", font=("Segoe UI", 36), fill=Colors.TEXT_MUTED)
+        c.create_text(w//2, h//2 + 20, text="Camera feed will appear here",
                       font=Fonts.BODY, fill=Colors.TEXT_MUTED)
-        c.create_text(w // 2, h // 2 + 45,
-                      text="Click \"Start Camera\" to begin",
+        c.create_text(w//2, h//2 + 45, text='Click "Start Camera" to begin',
                       font=Fonts.SMALL, fill=Colors.TEXT_MUTED)
 
     def _on_close(self):
