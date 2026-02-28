@@ -22,8 +22,8 @@ from ui.components import StyledButton, ToggleSwitch
 #  ROBOFLOW CONFIGURATION
 # ═════════════════════════════════════════════════════════
 
-ROBOFLOW_API_KEY = "E0ydCq2X9PG3cJwSAUyb"
-ROBOFLOW_MODEL = "p4-fiyhn/3"
+ROBOFLOW_API_KEY = "INxX0Lc0epqPhQXpIWj9"
+ROBOFLOW_MODEL = "p4-fiyhn-gluwc/4"
 
 
 class InFacApp(tk.Tk):
@@ -359,6 +359,10 @@ class InFacApp(tk.Tk):
     def _start_camera(self):
         cam_idx = int(self.cam_combo.get().replace("Camera ", ""))
         self.cap = cv2.VideoCapture(cam_idx)
+        
+        # Lower resolution to speed up preprocessing and inference
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
         if not self.cap.isOpened():
             self.cam_status_label.configure(text="● Camera Error", fg=Colors.DANGER)
@@ -449,8 +453,8 @@ class InFacApp(tk.Tk):
         # ── Trigger Roboflow inference ───────────────────
         if self.is_detecting:
             self._detect_interval += 1
-            # Send every 10th frame to avoid flooding the API
-            if self._detect_interval >= 10 and not self._inference_busy:
+            # Run local inference as fast as possible without overlapping
+            if self._detect_interval >= 2 and not self._inference_busy:
                 self._detect_interval = 0
                 self._run_inference_async(frame.copy())
 

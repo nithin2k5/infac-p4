@@ -24,6 +24,10 @@ def check_dependencies():
         import requests
     except ImportError:
         missing.append("requests")
+    try:
+        import inference
+    except ImportError:
+        missing.append("inference")
 
     if missing:
         print(f"Missing dependencies: {', '.join(missing)}")
