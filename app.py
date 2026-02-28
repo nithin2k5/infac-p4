@@ -10,8 +10,8 @@ import numpy as np
 import time
 import threading
 import base64
-import requests
 import io
+from inference import get_model
 from PIL import Image, ImageTk
 from datetime import datetime
 from ui.theme import Colors, Fonts, Dimensions, configure_styles
@@ -23,14 +23,14 @@ from ui.components import StyledButton, ToggleSwitch
 # ═════════════════════════════════════════════════════════
 
 ROBOFLOW_API_KEY = "E0ydCq2X9PG3cJwSAUyb"
-ROBOFLOW_MODEL = "p4-fiyhn/1"
-ROBOFLOW_URL = f"https://detect.roboflow.com/{ROBOFLOW_MODEL}"
+ROBOFLOW_MODEL = "p4-fiyhn/3"
 
 
 class InFacApp(tk.Tk):
     """Single-page industrial inspection application with live camera feed."""
 
     def __init__(self):
+        
         super().__init__()
 
         # ── Window Setup ─────────────────────────────────
@@ -58,6 +58,7 @@ class InFacApp(tk.Tk):
         self.cap = None
         self.is_running = False
         self.is_detecting = False
+        self.is_video_file = False
         self.frame_count = 0
         self.fps = 0.0
         self.last_fps_time = time.time()
@@ -75,6 +76,14 @@ class InFacApp(tk.Tk):
         self._detect_interval = 0          # frame counter for inference spacing
         self._inference_fps = 0.0
         self._last_inference_time = 0
+
+        # Load Local Model
+        # This caches weights locally on first run and runs offline afterward.
+        try:
+            self.model = get_model(model_id=ROBOFLOW_MODEL, api_key=ROBOFLOW_API_KEY)
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            self.model = None
 
         # ── Build UI ─────────────────────────────────────
         self._build_ui()
@@ -203,12 +212,12 @@ class InFacApp(tk.Tk):
             command=self._capture_frame, font=Fonts.BUTTON).pack(side="left", padx=4)
 
         StyledButton(
-            inner, text="�️  Upload Image", bg_color=Colors.BG_CARD,
+            inner, text="📂  Upload Media", bg_color=Colors.BG_CARD,
             hover_color=Colors.BG_CARD_HOVER, width=150, height=40,
-            command=self._upload_image, font=Fonts.BUTTON).pack(side="left", padx=4)
+            command=self._upload_media, font=Fonts.BUTTON).pack(side="left", padx=4)
 
         StyledButton(
-            inner, text="�🔄  Reset Stats", bg_color=Colors.BG_CARD,
+            inner, text="🔄  Reset Stats", bg_color=Colors.BG_CARD,
             hover_color=Colors.BG_CARD_HOVER, width=130, height=40,
             command=self._reset_stats, font=Fonts.BUTTON).pack(side="left", padx=4)
 
@@ -380,6 +389,7 @@ class InFacApp(tk.Tk):
     def _stop_camera(self):
         self.is_running = False
         self.is_detecting = False
+        self.is_video_file = False
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -412,8 +422,13 @@ class InFacApp(tk.Tk):
 
         ret, frame = self.cap.read()
         if not ret:
-            self.after(30, self._update_frame)
-            return
+            if getattr(self, "is_video_file", False):
+                self._stop_camera()
+                self.cam_status_label.configure(text="● Video Ended", fg=Colors.TEXT_MUTED)
+                return
+            else:
+                self.after(30, self._update_frame)
+                return
 
         self.frame_count += 1
         self.fps_frame_count += 1
@@ -528,46 +543,45 @@ class InFacApp(tk.Tk):
         thread.start()
 
     def _do_inference(self, frame):
-        """Perform Roboflow API inference (runs in background thread)."""
+        """Perform local offline inference (runs in background thread)."""
+        if self.model is None:
+            self.after(0, lambda: self.model_status_label.configure(
+                text="● Model not loaded", fg=Colors.DANGER))
+            self._inference_busy = False
+            return
+
         try:
-            # Encode frame as JPEG base64
-            _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            img_base64 = base64.b64encode(buffer).decode("utf-8")
-
-            # POST to Roboflow hosted API
-            params = {
-                "api_key": ROBOFLOW_API_KEY,
-                "confidence": int(self.confidence_threshold * 100),
-            }
-
-            resp = requests.post(
-                ROBOFLOW_URL,
-                params=params,
-                data=img_base64,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=10,
-            )
-
-            if resp.status_code == 200:
-                data = resp.json()
-                predictions = data.get("predictions", [])
-
-                with self._inference_lock:
-                    self.current_detections = predictions
-
-                # Schedule UI update on the main thread
-                self.after(0, self._on_inference_result, predictions)
+            # Run local inference
+            results = self.model.infer(frame, confidence=self.confidence_threshold)
+            
+            # Extract predictions based on inference SDK format
+            # inference returns a list of result objects for a single frame or multiple
+            if isinstance(results, list):
+                result = results[0]
             else:
-                self.after(0, lambda: self.model_status_label.configure(
-                    text=f"● API Error ({resp.status_code})", fg=Colors.DANGER))
+                result = results
+            
+            # Format predictions to match original structure
+            predictions = []
+            if hasattr(result, 'predictions'):
+                for p in result.predictions:
+                    predictions.append({
+                        "x": p.x,
+                        "y": p.y,
+                        "width": p.width,
+                        "height": p.height,
+                        "class": p.class_name,
+                        "confidence": p.confidence
+                    })
 
-        except requests.exceptions.Timeout:
-            self.after(0, lambda: self.model_status_label.configure(
-                text="● API Timeout", fg=Colors.WARNING))
-        except requests.exceptions.ConnectionError:
-            self.after(0, lambda: self.model_status_label.configure(
-                text="● Connection Error", fg=Colors.DANGER))
+            with self._inference_lock:
+                self.current_detections = predictions
+
+            # Schedule UI update on the main thread
+            self.after(0, self._on_inference_result, predictions)
+
         except Exception as e:
+            print(f"Inference error: {e}")
             self.after(0, lambda: self.model_status_label.configure(
                 text="● Inference Error", fg=Colors.DANGER))
         finally:
@@ -583,30 +597,33 @@ class InFacApp(tk.Tk):
 
         self.model_status_label.configure(text="● Detecting", fg=Colors.SUCCESS)
 
+        # ── PCB Solder Inspection Logic ───────────────────
+        # Count solder detections: 2 solders = PASS, <2 = NG
+        solder_count = sum(1 for p in predictions if p["class"].lower() == "solder")
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
         if predictions:
             for pred in predictions:
-                conf = pred["confidence"]
-                cls_name = pred["class"]
-                self.all_confidences.append(conf)
+                self.all_confidences.append(pred["confidence"])
 
-                # Determine if defect (any class that isn't "pass"/"ok"/"good")
-                is_defect = cls_name.lower() not in ("pass", "ok", "good", "normal")
-                if is_defect:
-                    self.total_defects += 1
-                    color = Colors.DANGER
-                else:
-                    color = Colors.SUCCESS
-
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                self._add_log_entry(
-                    cls_name.capitalize(),
-                    timestamp,
-                    color,
-                    f"{conf:.0%}"
-                )
+        if solder_count >= 2:
+            # PASS — both solders detected
+            self._add_log_entry(
+                "✅ PASS",
+                f"{timestamp}  •  {solder_count} solder(s)",
+                Colors.SUCCESS,
+                f"{max((p['confidence'] for p in predictions), default=0):.0%}"
+            )
         else:
-            # No detections = pass
-            self.all_confidences.append(1.0)
+            # NG — missing solder(s)
+            self.total_defects += 1
+            missing = 2 - solder_count
+            self._add_log_entry(
+                "❌ NG",
+                f"{timestamp}  •  {missing} solder(s) missing",
+                Colors.DANGER,
+                f"{solder_count}/2"
+            )
 
         # Update stats
         self.stat_labels["defects_val"].configure(text=str(self.total_defects))
@@ -645,10 +662,15 @@ class InFacApp(tk.Tk):
             with self._inference_lock:
                 self.current_detections = []
 
-    def _upload_image(self):
-        """Open a file dialog to upload an image for detection testing."""
-        filetypes = [("Image files", "*.jpg *.jpeg *.png *.bmp *.webp"), ("All files", "*.*")]
-        filepath = filedialog.askopenfilename(title="Select Image for Detection",
+    def _upload_media(self):
+        """Open a file dialog to upload an image or video for detection testing."""
+        filetypes = [
+            ("Media files", "*.jpg *.jpeg *.png *.bmp *.webp *.mp4 *.avi *.mov *.mkv"),
+            ("Image files", "*.jpg *.jpeg *.png *.bmp *.webp"),
+            ("Video files", "*.mp4 *.avi *.mov *.mkv"),
+            ("All files", "*.*")
+        ]
+        filepath = filedialog.askopenfilename(title="Select Media for Detection",
                                               filetypes=filetypes)
         if not filepath:
             return
@@ -657,7 +679,46 @@ class InFacApp(tk.Tk):
         if self.is_running:
             self._stop_camera()
 
-        # Load image
+        ext = filepath.lower().split('.')[-1]
+        is_video = ext in ['mp4', 'avi', 'mov', 'mkv']
+
+        if is_video:
+            self._start_video_file(filepath)
+        else:
+            self._load_static_image(filepath)
+
+    def _start_video_file(self, filepath):
+        """Start playing and detecting from a video file."""
+        self.cap = cv2.VideoCapture(filepath)
+        if not self.cap.isOpened():
+            self.model_status_label.configure(text="● Failed to load video", fg=Colors.DANGER)
+            return
+
+        self._static_frame = None
+        self._static_predictions = []
+        self.camera_canvas.unbind("<Configure>")
+
+        self.is_running = True
+        self.is_video_file = True
+        filename = filepath.replace("/", "\\").split("\\")[-1]
+        self.cam_status_label.configure(text=f"● Video: {filename}", fg=Colors.PRIMARY)
+
+        self.start_btn.itemconfig(self.start_btn._text_id, text="⏹  Stop Video")
+        self.start_btn.bg_color = Colors.DANGER_DIM
+        self.start_btn.hover_color = Colors.DANGER
+        self.start_btn.itemconfig(self.start_btn._bg_id, fill=Colors.DANGER_DIM)
+
+        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.res_label.configure(text=f"{w} × {h}")
+
+        self.last_fps_time = time.time()
+        self.fps_frame_count = 0
+        self._detect_interval = 0
+        self._update_frame()
+
+    def _load_static_image(self, filepath):
+        """Load and run inference on a single static image."""
         frame = cv2.imread(filepath)
         if frame is None:
             self.model_status_label.configure(text="● Failed to load image", fg=Colors.DANGER)
@@ -681,60 +742,75 @@ class InFacApp(tk.Tk):
         # Display the image immediately (no detections yet)
         self._display_static_frame(frame.copy(), [])
 
-        # Run inference
+        # Run local offline inference
+        if self.model is None:
+            self.model_status_label.configure(text="● Model not loaded", fg=Colors.DANGER)
+            return
+
         try:
-            _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            img_base64 = base64.b64encode(buffer).decode("utf-8")
-
-            params = {
-                "api_key": ROBOFLOW_API_KEY,
-                "confidence": int(self.confidence_threshold * 100),
-            }
-            resp = requests.post(
-                ROBOFLOW_URL, params=params, data=img_base64,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=15,
-            )
-
-            if resp.status_code == 200:
-                predictions = resp.json().get("predictions", [])
-                self._static_predictions = predictions  # store for resize redraw
-                self._display_static_frame(frame.copy(), predictions)
-                self.model_status_label.configure(text=f"● {len(predictions)} detection(s)", fg=Colors.SUCCESS)
-
-                # Log results
-                filename = filepath.replace("/", "\\").split("\\")[-1]
-                self.total_inspected += 1
-                self.stat_labels["total_inspected_val"].configure(text=str(self.total_inspected))
-                for pred in predictions:
-                    conf = pred["confidence"]
-                    cls_name = pred["class"]
-                    self.all_confidences.append(conf)
-                    is_defect = cls_name.lower() not in ("pass", "ok", "good", "normal")
-                    if is_defect:
-                        self.total_defects += 1
-                    self._add_log_entry(
-                        cls_name.capitalize(),
-                        f"Image: {filename}",
-                        Colors.DANGER if is_defect else Colors.SUCCESS,
-                        f"{conf:.0%}"
-                    )
-                if not predictions:
-                    self._add_log_entry("No detections", filename,
-                                        Colors.TEXT_MUTED, "--")
-
-                # Update stats
-                self.stat_labels["defects_val"].configure(text=str(self.total_defects))
-                if self.total_inspected > 0:
-                    pass_rate = (1 - self.total_defects / self.total_inspected) * 100
-                    self.stat_labels["pass_rate_val"].configure(text=f"{pass_rate:.1f}%")
-                if self.all_confidences:
-                    avg_c = sum(self.all_confidences) / len(self.all_confidences)
-                    self.stat_labels["avg_conf_val"].configure(text=f"{avg_c:.1%}")
+            results = self.model.infer(frame, confidence=self.confidence_threshold)
+            
+            if isinstance(results, list):
+                result = results[0]
             else:
+                result = results
+                
+            predictions = []
+            if hasattr(result, 'predictions'):
+                for p in result.predictions:
+                    predictions.append({
+                        "x": p.x,
+                        "y": p.y,
+                        "width": p.width,
+                        "height": p.height,
+                        "class": p.class_name,
+                        "confidence": p.confidence
+                    })
+
+            self._static_predictions = predictions  # store for resize redraw
+            self._display_static_frame(frame.copy(), predictions)
+
+            # ── PCB Solder Inspection Logic ───────────
+            solder_count = sum(1 for p in predictions if p["class"].lower() == "solder")
+            filename = filepath.replace("/", "\\").split("\\")[-1]
+            self.total_inspected += 1
+            self.stat_labels["total_inspected_val"].configure(text=str(self.total_inspected))
+
+            for pred in predictions:
+                self.all_confidences.append(pred["confidence"])
+
+            if solder_count >= 2:
                 self.model_status_label.configure(
-                    text=f"● API Error ({resp.status_code})", fg=Colors.DANGER)
+                    text=f"● PASS — {solder_count} solder(s)", fg=Colors.SUCCESS)
+                self._add_log_entry(
+                    "✅ PASS",
+                    f"Image: {filename}  •  {solder_count} solder(s)",
+                    Colors.SUCCESS,
+                    f"{max((p['confidence'] for p in predictions), default=0):.0%}"
+                )
+            else:
+                missing = 2 - solder_count
+                self.total_defects += 1
+                self.model_status_label.configure(
+                    text=f"● NG — {missing} solder(s) missing", fg=Colors.DANGER)
+                self._add_log_entry(
+                    "❌ NG",
+                    f"Image: {filename}  •  {missing} solder(s) missing",
+                    Colors.DANGER,
+                    f"{solder_count}/2"
+                )
+
+            # Update stats
+            self.stat_labels["defects_val"].configure(text=str(self.total_defects))
+            if self.total_inspected > 0:
+                pass_rate = (1 - self.total_defects / self.total_inspected) * 100
+                self.stat_labels["pass_rate_val"].configure(text=f"{pass_rate:.1f}%")
+            if self.all_confidences:
+                avg_c = sum(self.all_confidences) / len(self.all_confidences)
+                self.stat_labels["avg_conf_val"].configure(text=f"{avg_c:.1%}")
+                
         except Exception as e:
+            print(f"Static inference error: {e}")
             self.model_status_label.configure(text="● Inference Error", fg=Colors.DANGER)
 
     def _redraw_static(self, event=None):
