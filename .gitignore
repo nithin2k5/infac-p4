@@ -5,3 +5,23 @@ capture_*.jpg
 .env
 venv/
 .venv/
+
+# PyInstaller / Build artifacts
+build/
+dist/
+*.spec
+*.log
+
+# System files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDEs / Workspaces
+.vscode/
+.idea/
+
+# Local data / models (if any)
+models/
+*.pt
+*.onnx
