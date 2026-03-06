@@ -296,23 +296,25 @@ class InFacApp(tk.Tk):
         self.cam_combo.set("Camera 0")
         self.cam_combo.pack(fill="x", pady=(4, 0))
 
-        # Model info
+        # Result Indicators (PASS / NG)
         sep0 = tk.Frame(parent, bg=Colors.BORDER, height=1)
         sep0.pack(fill="x", padx=16, pady=8)
 
-        tk.Label(parent, text="🤖  Model", font=Fonts.SMALL_BOLD,
-                 bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY).pack(anchor="w", padx=16)
+        result_frame = tk.Frame(parent, bg=Colors.BG_CARD)
+        result_frame.pack(fill="x", padx=16, pady=(4, 4))
 
-        model_info = tk.Frame(parent, bg=Colors.BG_CARD)
-        model_info.pack(fill="x", padx=16, pady=(4, 4))
-        for key, val in [("Endpoint", "Roboflow Hosted API"),
-                         ("Model", ROBOFLOW_MODEL)]:
-            row = tk.Frame(model_info, bg=Colors.BG_CARD)
-            row.pack(fill="x", pady=1)
-            tk.Label(row, text=key, font=Fonts.TINY, bg=Colors.BG_CARD,
-                     fg=Colors.TEXT_MUTED).pack(side="left")
-            tk.Label(row, text=val, font=Fonts.TINY, bg=Colors.BG_CARD,
-                     fg=Colors.TEXT_PRIMARY).pack(side="right")
+        # Using a frame for each to simulate a button look with padding and background
+        self.pass_frame = tk.Frame(result_frame, bg=Colors.BG_MEDIUM, bd=1, relief="ridge")
+        self.pass_frame.pack(side="left", fill="x", expand=True, padx=(0, 4), ipady=8)
+        self.pass_label = tk.Label(self.pass_frame, text="PASS", font=Fonts.SUBHEADING,
+                                   bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+        self.pass_label.pack(expand=True)
+
+        self.ng_frame = tk.Frame(result_frame, bg=Colors.BG_MEDIUM, bd=1, relief="ridge")
+        self.ng_frame.pack(side="left", fill="x", expand=True, padx=(4, 0), ipady=8)
+        self.ng_label = tk.Label(self.ng_frame, text="NG", font=Fonts.SUBHEADING,
+                                 bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+        self.ng_label.pack(expand=True)
 
         # Separator
         tk.Frame(parent, bg=Colors.BORDER, height=1).pack(fill="x", padx=16, pady=8)
@@ -357,9 +359,9 @@ class InFacApp(tk.Tk):
         if getattr(self, "is_paused", False):
             # Resume from paused state
             self.is_paused = False
-            self.is_detecting = True  # Auto-resume detection
+            self.is_detecting = False  # Do not auto-resume detection
             self.cam_status_label.configure(text="● Camera Connected", fg=Colors.SUCCESS)
-            self.model_status_label.configure(text="● Detecting", fg=Colors.SUCCESS)
+            self.model_status_label.configure(text="● Model Idle", fg=Colors.TEXT_MUTED)
             self.start_btn.itemconfig(self.start_btn._text_id, text="⏹  Stop Camera")
             self.start_btn.bg_color = Colors.DANGER_DIM
             self.start_btn.hover_color = Colors.DANGER
@@ -425,9 +427,9 @@ class InFacApp(tk.Tk):
         self.camera_canvas.unbind("<Configure>")
 
         self.is_running = True
-        self.is_detecting = True  # Start detection automatically
+        self.is_detecting = False  # Start normally without automatically detecting
         self.cam_status_label.configure(text="● Camera Connected", fg=Colors.SUCCESS)
-        self.model_status_label.configure(text="● Detecting", fg=Colors.SUCCESS)
+        self.model_status_label.configure(text="● Model Idle", fg=Colors.TEXT_MUTED)
 
         self.start_btn.itemconfig(self.start_btn._text_id, text="⏹  Stop Camera")
         self.start_btn.bg_color = Colors.DANGER_DIM
@@ -468,6 +470,7 @@ class InFacApp(tk.Tk):
         self.camera_canvas.delete("all")
         self.camera_canvas.bind("<Configure>", self._draw_placeholder)
         self._draw_placeholder()
+        self._update_result_indicators([])
 
     def _update_frame(self):
         if not self.is_running or not self.cap:
@@ -655,6 +658,8 @@ class InFacApp(tk.Tk):
 
         self.model_status_label.configure(text="● Detecting", fg=Colors.SUCCESS)
 
+        self._update_result_indicators(predictions)
+
         # Note: We purposely do NOT log to the UI or update stats here during live feed.
         # Logging and stats belong only to the Test snapshot flow.
 
@@ -771,6 +776,7 @@ class InFacApp(tk.Tk):
             self._display_static_frame(frame.copy(), predictions)
 
             # ── PCB Presence Guard (static image) ─────
+            self._update_result_indicators(predictions)
             solder_preds = [p for p in predictions if p["class"].lower() == "solder"]
             solder_count = len(solder_preds)
             filename = filepath.replace("/", "\\").split("\\")[-1]
@@ -879,11 +885,10 @@ class InFacApp(tk.Tk):
         # Pause live camera update so the static result stays on screen
         if self.is_running:
             self.is_paused = True
-            if self.is_detecting:
-                self.is_detecting = False
-                self.model_status_label.configure(text="● Model Paused", fg=Colors.WARNING)
-                with self._inference_lock:
-                    self.current_detections = []
+            self.is_detecting = False
+            self.model_status_label.configure(text="● Model Paused", fg=Colors.WARNING)
+            with self._inference_lock:
+                self.current_detections = []
 
             # Change start button to Resume Camera
             self.start_btn.itemconfig(self.start_btn._text_id, text="▶  Resume Camera")
@@ -945,6 +950,7 @@ class InFacApp(tk.Tk):
 
         self._static_predictions = predictions
         self._display_static_frame(frame.copy(), predictions)
+        self._update_result_indicators(predictions)
 
         # Increment inspection count on Test
         self.total_inspected += 1
@@ -1024,6 +1030,7 @@ class InFacApp(tk.Tk):
                                      fg=Colors.TEXT_MUTED, justify="center")
         self.empty_label.pack(pady=40)
         self.log_count_label.configure(text="0 items")
+        self._update_result_indicators([])
 
     # ═════════════════════════════════════════════════════
     #  DETECTION LOG
@@ -1067,6 +1074,36 @@ class InFacApp(tk.Tk):
     # ═════════════════════════════════════════════════════
     #  HELPERS
     # ═════════════════════════════════════════════════════
+
+    def _update_result_indicators(self, predictions):
+        if not hasattr(self, 'pass_frame') or not hasattr(self, 'ng_frame'):
+            return
+            
+        pcb_preds = [p for p in predictions if p["class"].lower() == "pcb"]
+        solder_preds = [p for p in predictions if p["class"].lower() == "solder"]
+        
+        pcb_detected = len(pcb_preds) > 0
+        solder_count = len(solder_preds)
+        
+        if pcb_detected or solder_count > 0:
+            if solder_count >= 2:
+                # Glow PASS
+                self.pass_frame.configure(bg=Colors.SUCCESS)
+                self.pass_label.configure(bg=Colors.SUCCESS, fg=Colors.BG_DARKEST)
+                self.ng_frame.configure(bg=Colors.BG_MEDIUM)
+                self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+            else:
+                # Glow NG
+                self.pass_frame.configure(bg=Colors.BG_MEDIUM)
+                self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+                self.ng_frame.configure(bg=Colors.DANGER)
+                self.ng_label.configure(bg=Colors.DANGER, fg=Colors.TEXT_PRIMARY)
+        else:
+            # Reset
+            self.pass_frame.configure(bg=Colors.BG_MEDIUM)
+            self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+            self.ng_frame.configure(bg=Colors.BG_MEDIUM)
+            self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
 
     def _on_threshold_change(self, value):
         pct = int(float(value) * 100)
