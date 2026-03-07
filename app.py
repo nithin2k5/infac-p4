@@ -14,7 +14,9 @@ import base64
 import io
 import os
 
-from ultralytics import YOLO
+from core.camera import CameraManager
+from core.inference import InferenceEngine
+from core.inspection import InspectionManager
 from PIL import Image, ImageTk
 from datetime import datetime
 from ui.theme import Colors, Fonts, Dimensions, configure_styles
@@ -57,38 +59,20 @@ class InFacApp(tk.Tk):
         configure_styles(self)
 
         # ── State ────────────────────────────────────────
-        self.cap = None
-        self.is_running = False
-        self.is_detecting = False
-        self.is_video_file = False
-        self.frame_count = 0
-        self.fps = 0.0
-        self.last_fps_time = time.time()
-        self.fps_frame_count = 0
-        self.current_detections = []       # latest detections from Roboflow
-        self.detection_log_items = []      # log widgets in right panel
-        self.total_inspected = 0
-        self.total_defects = 0
-        self.all_confidences = []          # for avg confidence calc
-        self.confidence_threshold = 0.65
-        self.current_frame = None
-        self._photo_ref = None             # prevent GC
-        self._inference_lock = threading.Lock()
-        self._inference_busy = False       # throttle: one request at a time
-        self._detect_interval = 0          # frame counter for inference spacing
-        self._inference_fps = 0.0
-        self._last_inference_time = 0
-        self.frame_queue = queue.Queue(maxsize=1)
-        self.capture_thread = None
-        self.solder_history = []           # to smooth out flickering detections
+        self.camera = CameraManager()
+        self.inference = InferenceEngine(MODEL_PATH)
+        self.inspection = InspectionManager()
+        
+        self.inspection.on_log_result = self._add_log_entry
+        self.inspection.on_stats_update = self._update_stats_ui
 
-        # Load Local Model
-        # Loads the YOLO weights from the project folder.
-        try:
-            self.model = YOLO(MODEL_PATH)
-        except Exception as e:
-            print(f"Error loading model: {e}")
-            self.model = None
+        self.is_detecting = False
+        self.current_detections = []
+        self.detection_log_items = []
+        self.confidence_threshold = 0.65
+        self._photo_ref = None
+
+        threading.Thread(target=self.inference.load_model, daemon=True).start()
 
         # ── Build UI ─────────────────────────────────────
         self._build_ui()
@@ -293,6 +277,21 @@ class InFacApp(tk.Tk):
         self.cam_combo.set("Camera 0")
         self.cam_combo.pack(fill="x", pady=(4, 0))
 
+        # Auto-Inspect
+        auto_frame = tk.Frame(parent, bg=Colors.BG_CARD)
+        auto_frame.pack(fill="x", padx=16, pady=(4, 8))
+        tk.Label(auto_frame, text="Auto-Inspect", font=Fonts.SMALL_BOLD, bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY).pack(side="left")
+        self.auto_var = tk.BooleanVar(value=False)
+        auto_cb = ttk.Checkbutton(auto_frame, variable=self.auto_var, command=self._on_auto_toggle)
+        auto_cb.pack(side="right")
+        
+        # ROI Crop slider (Vertical height crop)
+        roi_frame = tk.Frame(parent, bg=Colors.BG_CARD)
+        roi_frame.pack(fill="x", padx=16, pady=(0, 8))
+        tk.Label(roi_frame, text="ROI Zoom (Center)", font=Fonts.SMALL_BOLD, bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY).pack(anchor="w")
+        self.roi_var = tk.DoubleVar(value=1.0)
+        ttk.Scale(roi_frame, from_=0.3, to=1.0, variable=self.roi_var, orient="horizontal").pack(fill="x", pady=(4, 0))
+
         # Result Indicators (PASS / NG)
         sep0 = tk.Frame(parent, bg=Colors.BORDER, height=1)
         sep0.pack(fill="x", padx=16, pady=8)
@@ -353,7 +352,7 @@ class InFacApp(tk.Tk):
     # ═════════════════════════════════════════════════════
 
     def _toggle_camera(self):
-        if getattr(self, "is_paused", False):
+        if self.camera.is_paused:
             # Resume from paused state
             self.is_paused = False
             self.is_detecting = True  # Auto-resume detection
@@ -364,115 +363,52 @@ class InFacApp(tk.Tk):
             self.start_btn.hover_color = Colors.DANGER
             self.start_btn.itemconfig(self.start_btn._bg_id, fill=Colors.DANGER_DIM)
             self.camera_canvas.unbind("<Configure>")
-        elif self.is_running:
+            self.camera.is_paused = False
+            self.is_detecting = True
+        elif self.camera.is_running:
             self._stop_camera()
         else:
             self._start_camera()
 
     def _start_camera(self):
         cam_idx = int(self.cam_combo.get().replace("Camera ", ""))
-
-        # Show connecting status & disable button while opening
         self.cam_status_label.configure(text="● Connecting...", fg=Colors.WARNING)
         self.start_btn.itemconfig(self.start_btn._text_id, text="⏳  Connecting...")
         self.update_idletasks()
-
-        # Open camera in background thread to avoid freezing the UI
-        thread = threading.Thread(
-            target=self._open_camera_thread, args=(cam_idx,), daemon=True)
-        thread.start()
-
-    def _open_camera_thread(self, cam_idx):
-        """Open camera in a background thread for faster, non-blocking init."""
-        import platform
-        # Use DirectShow on Windows for much faster camera initialization
-        if platform.system() == "Windows":
-            cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
-        else:
-            cap = cv2.VideoCapture(cam_idx)
-
-        # Lower resolution to speed up preprocessing and inference. Match model resolution 416x416.
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 416)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 416)
-        # Minimize the buffer so we always get the latest frame
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        if not cap.isOpened():
-            self.after(0, self._on_camera_open_failed)
-            return
-
-        # Pre-read one frame to fully initialise the pipeline
-        cap.read()
-
-        self.after(0, self._on_camera_opened, cap)
+        
+        self.camera.start_camera(cam_idx, self._on_camera_opened, self._on_camera_open_failed)
 
     def _on_camera_open_failed(self):
-        """Called on main thread when camera fails to open."""
-        self.cam_status_label.configure(text="● Camera Error", fg=Colors.DANGER)
-        self.start_btn.itemconfig(self.start_btn._text_id, text="▶  Start Camera")
+        self.after(0, lambda: self.cam_status_label.configure(text="● Camera Error", fg=Colors.DANGER))
+        self.after(0, lambda: self.start_btn.itemconfig(self.start_btn._text_id, text="▶  Start Camera"))
         self.start_btn.bg_color = Colors.SUCCESS_DIM
         self.start_btn.hover_color = Colors.SUCCESS
         self.start_btn.itemconfig(self.start_btn._bg_id, fill=Colors.SUCCESS_DIM)
 
-    def _on_camera_opened(self, cap):
-        """Called on main thread once the camera is ready."""
-        self.cap = cap
-
-        # Clear any uploaded image state
+    def _on_camera_opened(self, w, h):
         self._static_frame = None
         self._static_predictions = []
         self.camera_canvas.unbind("<Configure>")
-
-        self.is_running = True
-        self.is_detecting = True  # Start detection automatically
+        
+        self.is_detecting = True
         self.cam_status_label.configure(text="● Camera Connected", fg=Colors.SUCCESS)
         self.model_status_label.configure(text="● Detecting", fg=Colors.SUCCESS)
-
+        
         self.start_btn.itemconfig(self.start_btn._text_id, text="⏹  Stop Camera")
         self.start_btn.bg_color = Colors.DANGER_DIM
         self.start_btn.hover_color = Colors.DANGER
         self.start_btn.itemconfig(self.start_btn._bg_id, fill=Colors.DANGER_DIM)
-
-        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
         self.res_label.configure(text=f"{w} × {h}")
-
-        self.last_fps_time = time.time()
-        self.fps_frame_count = 0
         self._detect_interval = 0
-
-        self.capture_thread = threading.Thread(target=self._camera_capture_loop, daemon=True)
-        self.capture_thread.start()
-
+        self._inference_busy = False
+        
         self._update_frame()
 
-    def _camera_capture_loop(self):
-        """Continuously read frames in the background to avoid blocking the UI."""
-        while getattr(self, "is_running", False) and self.cap and self.cap.isOpened():
-            if getattr(self, "is_video_file", False):
-                time.sleep(0.05)
-                continue
-            
-            ret, frame = self.cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
-                
-            if not self.frame_queue.empty():
-                try:
-                    self.frame_queue.get_nowait()
-                except queue.Empty:
-                    pass
-            self.frame_queue.put(frame)
-
     def _stop_camera(self):
-        self.is_running = False
+        self.camera.is_running = False
         self.is_detecting = False
-        self.is_video_file = False
-        self.is_paused = False
-        if self.cap:
-            self.cap.release()
-            self.cap = None
+        self.camera.stop()
 
         self.cam_status_label.configure(text="● Camera Disconnected", fg=Colors.DANGER)
         self.model_status_label.configure(text="● Model Idle", fg=Colors.TEXT_MUTED)
@@ -493,60 +429,54 @@ class InFacApp(tk.Tk):
         self._update_result_indicators([])
 
     def _update_frame(self):
-        if not self.is_running or not self.cap:
+        frame, is_end = self.camera.read_frame()
+        
+        if is_end:
+            self._stop_camera()
+            self.cam_status_label.configure(text="● Video Ended", fg=Colors.TEXT_MUTED)
             return
 
-        if getattr(self, "is_video_file", False):
-            ret, frame = self.cap.read()
-            if not ret:
-                self._stop_camera()
-                self.cam_status_label.configure(text="● Video Ended", fg=Colors.TEXT_MUTED)
-                return
-        else:
-            try:
-                frame = self.frame_queue.get_nowait()
-            except queue.Empty:
+        if frame is None:
+            if self.camera.is_running:
                 self.after(10, self._update_frame)
-                return
-
-        if getattr(self, "is_paused", False):
-            self.after(15, self._update_frame)
             return
 
-        self.frame_count += 1
-        self.fps_frame_count += 1
         self.current_frame = frame.copy()
+        
+        self.fps_label.configure(text=f"FPS: {self.camera.fps:.1f}")
+        self.stat_labels["fps_stat_val"].configure(text=f"{self.camera.fps:.0f}")
+        self.frame_label.configure(text=f"Frame: {self.camera.frame_count:,}")
 
-        # Calculate FPS
-        now = time.time()
-        elapsed = now - self.last_fps_time
-        if elapsed >= 1.0:
-            self.fps = self.fps_frame_count / elapsed
-            self.fps_frame_count = 0
-            self.last_fps_time = now
-            self.fps_label.configure(text=f"FPS: {self.fps:.1f}")
-            self.stat_labels["fps_stat_val"].configure(text=f"{self.fps:.0f}")
+        # Provide ROI to inference based on slider
+        roi_scale = self.roi_var.get()
+        h_frame, w_frame = frame.shape[:2]
+        new_w, new_h = int(w_frame * roi_scale), int(h_frame * roi_scale)
+        rx, ry = (w_frame - new_w) // 2, (h_frame - new_h) // 2
+        
+        roi = None if roi_scale >= 0.99 else (rx, ry, new_w, new_h)
 
-        self.frame_label.configure(text=f"Frame: {self.frame_count:,}")
-
-        # ── Trigger Roboflow inference ───────────────────
         if self.is_detecting:
             self._detect_interval += 1
-            # Run local inference as fast as possible without overlapping
-            if self._detect_interval >= 2 and not self._inference_busy:
+            if self._detect_interval >= 2 and not getattr(self, '_inference_busy', False):
                 self._detect_interval = 0
-                self._run_inference_async(frame.copy())
+                self._inference_busy = True
+                
+                # Run inference in background
+                def _bg_infer():
+                    preds = self.inference.infer(frame.copy(), self.confidence_threshold, roi)
+                    self.after(0, self._on_live_inference_result, preds)
+                
+                threading.Thread(target=_bg_infer, daemon=True).start()
 
-        # ── Draw frame with detection overlays ───────────
         display_frame = frame.copy()
 
+        # Draw ROI Box if scaled
+        if roi:
+            cv2.rectangle(display_frame, (rx, ry), (rx + new_w, ry + new_h), (255, 255, 255), 2, cv2.LINE_DASH)
+            cv2.putText(display_frame, "ROI Mask", (rx + 5, ry + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
         if self.is_detecting:
-            h_frame, w_frame = display_frame.shape[:2]
-
-            # Draw bounding boxes from latest detections
-            with self._inference_lock:
-                dets = list(self.current_detections)
-
+            dets = list(self.current_detections)
             for det in dets:
                 x1 = int(det["x"] - det["width"] / 2)
                 y1 = int(det["y"] - det["height"] / 2)
@@ -554,51 +484,36 @@ class InFacApp(tk.Tk):
                 y2 = int(det["y"] + det["height"] / 2)
                 conf = det["confidence"]
                 cls_name = det["class"]
-
-                # Vivid colors for visibility
-                if conf >= 0.8:
-                    color_bgr = (0, 255, 0)       # bright green
-                elif conf >= 0.5:
-                    color_bgr = (0, 255, 255)     # bright yellow
-                else:
-                    color_bgr = (0, 0, 255)       # bright red
-
-                # Thick bounding box
+                color_bgr = (0, 255, 0) if conf >= 0.8 else (0, 255, 255) if conf >= 0.5 else (0, 0, 255)
                 cv2.rectangle(display_frame, (x1, y1), (x2, y2), color_bgr, 3)
-
+                
                 # Bold corner accents
-                corner_len = min(20, min(x2-x1, y2-y1) // 3)
+                corner_len = min(20, min(max(1, x2-x1), max(1, y2-y1)) // 3)
                 for cx, cy, dx, dy in [(x1, y1, 1, 1), (x2, y1, -1, 1),
                                         (x1, y2, 1, -1), (x2, y2, -1, -1)]:
                     cv2.line(display_frame, (cx, cy), (cx + corner_len*dx, cy), color_bgr, 4)
                     cv2.line(display_frame, (cx, cy), (cx, cy + corner_len*dy), color_bgr, 4)
 
-                # Large label background + text
                 label_text = f"{cls_name} {conf:.0%}"
                 (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
                 cv2.rectangle(display_frame, (x1, y1 - th - 14), (x1 + tw + 14, y1), color_bgr, -1)
                 cv2.putText(display_frame, label_text, (x1 + 7, y1 - 7),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
 
-            # Crosshair
             cx, cy = w_frame // 2, h_frame // 2
             cv2.line(display_frame, (cx-20, cy), (cx+20, cy), (88, 166, 255), 1)
             cv2.line(display_frame, (cx, cy-20), (cx, cy+20), (88, 166, 255), 1)
 
-            # Timestamp
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             cv2.putText(display_frame, ts, (10, h_frame - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (138, 148, 158), 1)
 
-            # DETECTING indicator
             cv2.circle(display_frame, (w_frame - 30, 25), 8, (0, 0, 255), -1)
             cv2.putText(display_frame, "DETECTING", (w_frame - 130, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-        # Convert to Tkinter image
         rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
-
         canvas_w = self.camera_canvas.winfo_width()
         canvas_h = self.camera_canvas.winfo_height()
         if canvas_w > 10 and canvas_h > 10:
@@ -606,68 +521,45 @@ class InFacApp(tk.Tk):
             scale = min(canvas_w / img_w, canvas_h / img_h)
             new_w, new_h = int(img_w * scale), int(img_h * scale)
             img = img.resize((new_w, new_h), Image.LANCZOS)
-
         photo = ImageTk.PhotoImage(image=img)
         self._photo_ref = photo
         self.camera_canvas.delete("all")
         self.camera_canvas.create_image(canvas_w // 2, canvas_h // 2,
                                          image=photo, anchor="center")
-
         self.after(15, self._update_frame)
 
-    # ═════════════════════════════════════════════════════
-    #  ROBOFLOW INFERENCE
-    # ═════════════════════════════════════════════════════
-
-    def _run_inference_async(self, frame):
-        """Send a frame to Roboflow in a background thread."""
-        self._inference_busy = True
-        thread = threading.Thread(target=self._do_inference, args=(frame,), daemon=True)
-        thread.start()
-
-    def _do_inference(self, frame):
-        """Perform local offline inference (runs in background thread)."""
-        if self.model is None:
-            self.after(0, lambda: self.model_status_label.configure(
-                text="● Model not loaded", fg=Colors.DANGER))
-            self._inference_busy = False
-            return
-
-        try:
-            predictions = self._infer_with_roi(frame)
-
-            with self._inference_lock:
-                self.current_detections = predictions
-
-            # Schedule UI update on the main thread
-            self.after(0, self._on_inference_result, predictions)
-
-        except Exception as e:
-            print(f"Inference error: {e}")
-            self.after(0, lambda: self.model_status_label.configure(
-                text="● Inference Error", fg=Colors.DANGER))
-        finally:
-            self._inference_busy = False
-
-    def _on_inference_result(self, predictions):
-        """Handle inference results on the main thread — update stats & log."""
+    def _on_live_inference_result(self, predictions):
+        self._inference_busy = False
         if not self.is_detecting:
             return
+            
+        self.current_detections = predictions
+        
+        # Pass to inspection logic for glowing PASS/FAIL indicators and Auto-Inspect
+        pcb_detected, solder_count = self.inspection.process_live_frame(predictions)
+        
+        if pcb_detected or solder_count > 0:
+            if solder_count >= 2:
+                self.pass_frame.configure(bg=Colors.SUCCESS)
+                self.pass_label.configure(bg=Colors.SUCCESS, fg=Colors.BG_DARKEST)
+                self.ng_frame.configure(bg=Colors.BG_MEDIUM)
+                self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+                self.model_status_label.configure(text="● PASS - Detected", fg=Colors.SUCCESS)
+            else:
+                self.pass_frame.configure(bg=Colors.BG_MEDIUM)
+                self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+                self.ng_frame.configure(bg=Colors.DANGER)
+                self.ng_label.configure(bg=Colors.DANGER, fg=Colors.TEXT_PRIMARY)
+                self.model_status_label.configure(text="● NG - Inspecting", fg=Colors.DANGER)
+        else:
+            self.pass_frame.configure(bg=Colors.BG_MEDIUM)
+            self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+            self.ng_frame.configure(bg=Colors.BG_MEDIUM)
+            self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+            self.model_status_label.configure(text="● Detecting", fg=Colors.SUCCESS)
 
-        # ── Proceed with inspection ────────
-        solder_preds = [p for p in predictions if p["class"].lower() == "solder"]
-        solder_count = len(solder_preds)
-
-        self.model_status_label.configure(text="● Detecting", fg=Colors.SUCCESS)
-
-        self._update_result_indicators(predictions)
-
-        # Note: We purposely do NOT log to the UI or update stats here during live feed.
-        # Logging and stats belong only to the Test snapshot flow.
-
-    # ═════════════════════════════════════════════════════
-    #  CONTROLS
-    # ═════════════════════════════════════════════════════
+    def _on_auto_toggle(self):
+        self.inspection.auto_inspect_enabled = self.auto_var.get()
 
     def _upload_media(self):
         """Open a file dialog to upload an image or video for detection testing."""
@@ -683,7 +575,7 @@ class InFacApp(tk.Tk):
             return
 
         # Stop live camera if running
-        if self.is_running:
+        if self.camera.is_running:
             self._stop_camera()
 
         ext = filepath.lower().split('.')[-1]
@@ -695,9 +587,8 @@ class InFacApp(tk.Tk):
             self._load_static_image(filepath)
 
     def _start_video_file(self, filepath):
-        """Start playing and detecting from a video file."""
-        self.cap = cv2.VideoCapture(filepath)
-        if not self.cap.isOpened():
+        w, h = self.camera.start_video(filepath)
+        if w is None:
             self.model_status_label.configure(text="● Failed to load video", fg=Colors.DANGER)
             return
 
@@ -705,9 +596,8 @@ class InFacApp(tk.Tk):
         self._static_predictions = []
         self.camera_canvas.unbind("<Configure>")
 
-        self.is_running = True
-        self.is_video_file = True
-        filename = filepath.replace("/", "\\").split("\\")[-1]
+        self.is_detecting = True
+        filename = filepath.replace("/", "\").split("\")[-1]
         self.cam_status_label.configure(text=f"● Video: {filename}", fg=Colors.PRIMARY)
 
         self.start_btn.itemconfig(self.start_btn._text_id, text="⏹  Stop Video")
@@ -715,103 +605,53 @@ class InFacApp(tk.Tk):
         self.start_btn.hover_color = Colors.DANGER
         self.start_btn.itemconfig(self.start_btn._bg_id, fill=Colors.DANGER_DIM)
 
-        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.res_label.configure(text=f"{w} × {h}")
-
-        self.last_fps_time = time.time()
-        self.fps_frame_count = 0
         self._detect_interval = 0
         self._update_frame()
-
     def _load_static_image(self, filepath):
-        """Load and run inference on a single static image."""
         frame = cv2.imread(filepath)
         if frame is None:
             self.model_status_label.configure(text="● Failed to load image", fg=Colors.DANGER)
             return
 
         self.current_frame = frame.copy()
-        self._static_frame = frame.copy()       # store for resize redraw
-        self._static_predictions = []            # store for resize redraw
+        self._static_frame = frame.copy()
+        self._static_predictions = []
 
-        # Unbind placeholder so uploaded image persists on resize
         self.camera_canvas.unbind("<Configure>")
         self.camera_canvas.bind("<Configure>", self._redraw_static)
 
-        # Show image dimensions
         h_img, w_img = frame.shape[:2]
         self.res_label.configure(text=f"{w_img} × {h_img}")
         self.cam_status_label.configure(text="● Image Loaded", fg=Colors.PRIMARY)
         self.model_status_label.configure(text="● Running inference...", fg=Colors.WARNING)
         self.update_idletasks()
 
-        # Display the image immediately (no detections yet)
         self._display_static_frame(frame.copy(), [])
 
-        # Run local offline inference
-        if self.model is None:
-            self.model_status_label.configure(text="● Model not loaded", fg=Colors.DANGER)
-            return
-
-        try:
-            predictions = self._infer_with_roi(frame)
-
-            self._static_predictions = predictions  # store for resize redraw
-            self._display_static_frame(frame.copy(), predictions)
-
-            # ── PCB Presence Guard (static image) ─────
-            self._update_result_indicators(predictions)
-            solder_preds = [p for p in predictions if p["class"].lower() == "solder"]
-            solder_count = len(solder_preds)
-            filename = filepath.replace("/", "\\").split("\\")[-1]
-
-            if solder_count == 0:
-                # No PCB detected in the uploaded image
-                self.model_status_label.configure(
-                    text="● No PCB detected in image", fg=Colors.WARNING)
+        def _bg_static():
+            if not self.inference.is_loaded():
+                self.after(0, lambda: self.model_status_label.configure(text="● Model not loaded", fg=Colors.DANGER))
                 return
+            try:
+                # Use current ROI slider value
+                roi_scale = self.roi_var.get()
+                roi = None if roi_scale >= 0.99 else ((w_img - int(w_img * roi_scale)) // 2, (h_img - int(h_img * roi_scale)) // 2, int(w_img * roi_scale), int(h_img * roi_scale))
 
-            self.total_inspected += 1
-            self.stat_labels["total_inspected_val"].configure(text=str(self.total_inspected))
-
-            for pred in solder_preds:
-                self.all_confidences.append(pred["confidence"])
-
-            if solder_count >= 2:
-                self.model_status_label.configure(
-                    text=f"● PASS — {solder_count} solder(s)", fg=Colors.SUCCESS)
-                self._add_log_entry(
-                    "✅ PASS",
-                    f"Image: {filename}  •  {solder_count} solder(s)",
-                    Colors.SUCCESS,
-                    f"{max((p['confidence'] for p in solder_preds), default=0):.0%}"
-                )
-            else:
-                missing = 2 - solder_count
-                self.total_defects += 1
-                self.model_status_label.configure(
-                    text=f"● NG — {missing} solder(s) missing", fg=Colors.DANGER)
-                self._add_log_entry(
-                    "❌ NG",
-                    f"Image: {filename}  •  {missing} solder(s) missing",
-                    Colors.DANGER,
-                    f"{solder_count}/2"
-                )
-
-            # Update stats
-            self.stat_labels["defects_val"].configure(text=str(self.total_defects))
-            if self.total_inspected > 0:
-                pass_rate = (1 - self.total_defects / self.total_inspected) * 100
-                self.stat_labels["pass_rate_val"].configure(text=f"{pass_rate:.1f}%")
-            if self.all_confidences:
-                avg_c = sum(self.all_confidences) / len(self.all_confidences)
-                self.stat_labels["avg_conf_val"].configure(text=f"{avg_c:.1%}")
+                predictions = self.inference.infer(frame, self.confidence_threshold, roi)
+                self.after(0, self._on_static_result, frame.copy(), filepath, predictions)
+            except Exception as e:
+                print(e)
+                self.after(0, lambda: self.model_status_label.configure(text="● Inference Error", fg=Colors.DANGER))
                 
-        except Exception as e:
-            print(f"Static inference error: {e}")
-            self.model_status_label.configure(text="● Inference Error", fg=Colors.DANGER)
-
+        threading.Thread(target=_bg_static, daemon=True).start()
+        
+    def _on_static_result(self, frame, filepath, predictions):
+        self._static_predictions = predictions
+        self._display_static_frame(frame.copy(), predictions)
+        
+        filename = filepath.replace("/", "\").split("\")[-1]
+        self.inspection.process_test_snapshot(predictions, filename)
     def _redraw_static(self, event=None):
         """Redraw the uploaded image on canvas resize."""
         if hasattr(self, '_static_frame') and self._static_frame is not None:
@@ -860,29 +700,23 @@ class InFacApp(tk.Tk):
                                          image=photo, anchor="center")
 
     def _test_detect(self):
-        """Take a snapshot from the live camera and run detection on it."""
         if self.current_frame is None:
             return
 
-        # Grab a copy of the current frame
         frame = self.current_frame.copy()
 
-        # Pause live camera update so the static result stays on screen
-        if self.is_running:
-            self.is_paused = True
+        if self.camera.is_running:
+            self.camera.is_paused = True
             if self.is_detecting:
                 self.is_detecting = False
                 self.model_status_label.configure(text="● Model Paused", fg=Colors.WARNING)
-                with self._inference_lock:
-                    self.current_detections = []
+                self.current_detections = []
 
-            # Change start button to Resume Camera
             self.start_btn.itemconfig(self.start_btn._text_id, text="▶  Resume Camera")
             self.start_btn.bg_color = Colors.SUCCESS_DIM
             self.start_btn.hover_color = Colors.SUCCESS
             self.start_btn.itemconfig(self.start_btn._bg_id, fill=Colors.SUCCESS_DIM)
 
-        # Use the same static-image display pipeline
         self._static_frame = frame.copy()
         self._static_predictions = []
         self.camera_canvas.unbind("<Configure>")
@@ -894,83 +728,31 @@ class InFacApp(tk.Tk):
         self.model_status_label.configure(text="● Running inference...", fg=Colors.WARNING)
         self.update_idletasks()
 
-        # Show the raw frame immediately
         self._display_static_frame(frame.copy(), [])
 
-        # Run inference in background to keep UI responsive
         def _run():
-            if self.model is None:
-                self.after(0, lambda: self.model_status_label.configure(
-                    text="● Model not loaded", fg=Colors.DANGER))
+            if not self.inference.is_loaded():
+                self.after(0, lambda: self.model_status_label.configure(text="● Model not loaded", fg=Colors.DANGER))
                 return
             try:
-                predictions = self._infer_with_roi(frame)
+                roi_scale = self.roi_var.get()
+                roi = None if roi_scale >= 0.99 else ((w_img - int(w_img * roi_scale)) // 2, (h_img - int(h_img * roi_scale)) // 2, int(w_img * roi_scale), int(h_img * roi_scale))
+
+                predictions = self.inference.infer(frame, self.confidence_threshold, roi)
                 self.after(0, self._on_test_result, frame, predictions)
             except Exception as e:
                 print(f"Test inference error: {e}")
-                self.after(0, lambda: self.model_status_label.configure(
-                    text="● Inference Error", fg=Colors.DANGER))
+                self.after(0, lambda: self.model_status_label.configure(text="● Inference Error", fg=Colors.DANGER))
 
         threading.Thread(target=_run, daemon=True).start()
 
     def _on_test_result(self, frame, predictions):
-        """Display test detection results on the main thread."""
-        solder_preds = [p for p in predictions if p["class"].lower() == "solder"]
-        solder_count = len(solder_preds)
-
         self._static_predictions = predictions
         self._display_static_frame(frame.copy(), predictions)
-        self._update_result_indicators(predictions)
-
-        # Increment inspection count on Test
-        self.total_inspected += 1
-        self.stat_labels["total_inspected_val"].configure(text=str(self.total_inspected))
-
-        timestamp = datetime.now().strftime("%H:%M:%S")
-
-        if solder_count == 2:
-            self.model_status_label.configure(text="● Test PASS", fg=Colors.SUCCESS)
-            self._add_log_entry(
-                "✅ PASS",
-                f"{timestamp}  •  {solder_count} solder(s)",
-                Colors.SUCCESS,
-                f"{max((p['confidence'] for p in solder_preds), default=0):.0%}" if solder_preds else "--"
-            )
-        else:
-            self.model_status_label.configure(text="● Test NG", fg=Colors.DANGER)
-            self.total_defects += 1
-            if solder_count < 2:
-                missing = 2 - solder_count
-                detail_msg = f"{timestamp}  •  {missing} solder(s) missing"
-            else:
-                extra = solder_count - 2
-                detail_msg = f"{timestamp}  •  {extra} extra solder(s)"
-
-            self._add_log_entry(
-                "❌ NG",
-                detail_msg,
-                Colors.DANGER,
-                f"{solder_count}/2"
-            )
-
-        # Record confidences and update stats
-        for pred in solder_preds:
-            self.all_confidences.append(pred["confidence"])
-
-        self.stat_labels["defects_val"].configure(text=str(self.total_defects))
-
-        if self.total_inspected > 0:
-            pass_rate = (1 - self.total_defects / self.total_inspected) * 100
-            self.stat_labels["pass_rate_val"].configure(text=f"{pass_rate:.1f}%")
-        
-        if self.all_confidences:
-            avg_conf = sum(self.all_confidences) / len(self.all_confidences)
-            self.stat_labels["avg_conf_val"].configure(text=f"{avg_conf:.1%}")
+        self.inspection.process_test_snapshot(predictions, "Test snapshot")
 
     def _reset_stats(self):
-        self.total_inspected = 0
-        self.total_defects = 0
-        self.all_confidences.clear()
+        self.inspection.reset_stats()
         self.detection_log_items.clear()
         self.stat_labels["total_inspected_val"].configure(text="0")
         self.stat_labels["defects_val"].configure(text="0")
@@ -990,6 +772,13 @@ class InFacApp(tk.Tk):
     # ═════════════════════════════════════════════════════
     #  DETECTION LOG
     # ═════════════════════════════════════════════════════
+
+    def _update_stats_ui(self):
+        stats = self.inspection.get_stats()
+        self.stat_labels["total_inspected_val"].configure(text=str(stats["inspected"]))
+        self.stat_labels["defects_val"].configure(text=str(stats["defects"]))
+        self.stat_labels["pass_rate_val"].configure(text=f"{stats['pass_rate']:.1f}%")
+        self.stat_labels["avg_conf_val"].configure(text=f"{stats['avg_conf']:.1%}")
 
     def _add_log_entry(self, label, detail, color, confidence):
         """Add an entry to the detection log panel."""
@@ -1030,151 +819,6 @@ class InFacApp(tk.Tk):
     #  HELPERS
     # ═════════════════════════════════════════════════════
 
-    def _infer_with_roi(self, frame):
-        """Infer on full frame and apply NMS (ROI suffix kept for method compatibility)."""
-        results = self.model(frame, conf=self.confidence_threshold, verbose=False)
-        result = results[0]
-
-        raw_predictions = []
-        if len(result.boxes) > 0:
-            for box in result.boxes:
-                # Ultralytics boxes: xywh (center X, center Y, width, height) format
-                x, y, w, h = box.xywh[0].cpu().numpy()
-                cls_id = int(box.cls[0].item())
-                confidence = float(box.conf[0].item())
-                class_name = result.names[cls_id]
-
-                # --- Strict Detection Rules ---
-                if class_name.lower() == "solder":
-                    # 1. Require higher confidence for solders
-                    if confidence < 0.75:
-                        continue
-                    
-                    # 2. Aspect Ratio (A good solder is roughly circular/square)
-                    # A bad solder streak or glare might be very wide or very tall
-                    aspect_ratio = float(w) / float(h)
-                    if aspect_ratio > 1.8 or aspect_ratio < 0.55:
-                        continue
-                    
-                    # 3. Minimum / Maximum Size Filter
-                    # Ignores tiny specs of dust or massive false positives
-                    if w < 10 or h < 10:
-                        continue
-                    if w > 120 or h > 120:
-                        continue
-
-                raw_predictions.append({
-                    "x": float(x),
-                    "y": float(y),
-                    "width": float(w),
-                    "height": float(h),
-                    "class": class_name.lower(),
-                    "confidence": confidence
-                })
-                
-        return self._apply_nms(raw_predictions, iou_threshold=0.3)
-        
-    def _apply_nms(self, predictions, iou_threshold=0.3):
-        """Apply Non-Maximum Suppression to filter out overlapping bounding boxes."""
-        if not predictions:
-            return []
-            
-        # Group by class
-        by_class = {}
-        for p in predictions:
-            c = p["class"]
-            if c not in by_class:
-                by_class[c] = []
-            by_class[c].append(p)
-            
-        final_preds = []
-        
-        for cls_name, preds in by_class.items():
-            # Sort by confidence descending
-            preds.sort(key=lambda x: x["confidence"], reverse=True)
-            
-            keep = []
-            for p in preds:
-                # Convert to x1, y1, x2, y2 for easier IoU calc
-                x1_a = p["x"] - p["width"] / 2
-                y1_a = p["y"] - p["height"] / 2
-                x2_a = p["x"] + p["width"] / 2
-                y2_a = p["y"] + p["height"] / 2
-                area_a = p["width"] * p["height"]
-                
-                overlap = False
-                for k in keep:
-                    x1_b = k["x"] - k["width"] / 2
-                    y1_b = k["y"] - k["height"] / 2
-                    x2_b = k["x"] + k["width"] / 2
-                    y2_b = k["y"] + k["height"] / 2
-                    area_b = k["width"] * k["height"]
-                    
-                    # Calculate intersection
-                    inter_x1 = max(x1_a, x1_b)
-                    inter_y1 = max(y1_a, y1_b)
-                    inter_x2 = min(x2_a, x2_b)
-                    inter_y2 = min(y2_a, y2_b)
-                    
-                    if inter_x2 > inter_x1 and inter_y2 > inter_y1:
-                        inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
-                        union_area = area_a + area_b - inter_area
-                        iou = inter_area / union_area
-                        
-                        if iou > iou_threshold:
-                            overlap = True
-                            break
-                            
-                if not overlap:
-                    keep.append(p)
-                    
-            final_preds.extend(keep)
-            
-        return final_preds
-
-    def _update_result_indicators(self, predictions):
-        if not hasattr(self, 'pass_frame') or not hasattr(self, 'ng_frame'):
-            return
-            
-        pcb_preds = [p for p in predictions if p["class"].lower() == "pcb"]
-        solder_preds = [p for p in predictions if p["class"].lower() == "solder"]
-        
-        pcb_detected = len(pcb_preds) > 0
-        current_solder_count = len(solder_preds)
-        
-        # Keep a rolling window of the last 5 frames to prevent flickering
-        if getattr(self, "is_detecting", False) and not getattr(self, "is_paused", False):
-            self.solder_history.append(current_solder_count)
-            if len(self.solder_history) > 5:
-                self.solder_history.pop(0)
-            
-            # Use the highest number of solders seen in the last 5 frames 
-            # (since missing a detection is common, but hallucinating a fake perfect solder is rare)
-            effective_solder_count = max(self.solder_history) if self.solder_history else current_solder_count
-        else:
-            effective_solder_count = current_solder_count
-            self.solder_history = []
-        
-        if pcb_detected or effective_solder_count > 0:
-            if effective_solder_count >= 2:
-                # Glow PASS
-                self.pass_frame.configure(bg=Colors.SUCCESS)
-                self.pass_label.configure(bg=Colors.SUCCESS, fg=Colors.BG_DARKEST)
-                self.ng_frame.configure(bg=Colors.BG_MEDIUM)
-                self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
-            else:
-                # Glow NG
-                self.pass_frame.configure(bg=Colors.BG_MEDIUM)
-                self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
-                self.ng_frame.configure(bg=Colors.DANGER)
-                self.ng_label.configure(bg=Colors.DANGER, fg=Colors.TEXT_PRIMARY)
-        else:
-            # Reset
-            self.pass_frame.configure(bg=Colors.BG_MEDIUM)
-            self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
-            self.ng_frame.configure(bg=Colors.BG_MEDIUM)
-            self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
-
     def _on_threshold_change(self, value):
         pct = int(float(value) * 100)
         self.confidence_threshold = float(value)
@@ -1205,7 +849,7 @@ class InFacApp(tk.Tk):
                       font=Fonts.SMALL, fill=Colors.TEXT_MUTED)
 
     def _on_close(self):
-        self.is_running = False
+        self.camera.is_running = False
         if self.cap:
             self.cap.release()
         self.destroy()
