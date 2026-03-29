@@ -25,9 +25,9 @@ def check_dependencies():
     except ImportError:
         missing.append("requests")
     try:
-        import ultralytics
+        import numpy
     except ImportError:
-        missing.append("ultralytics")
+        missing.append("numpy")
 
     if missing:
         print(f"Missing dependencies: {', '.join(missing)}")

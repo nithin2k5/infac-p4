@@ -24,10 +24,9 @@ from ui.components import StyledButton, ToggleSwitch
 
 
 # ═════════════════════════════════════════════════════════
-#  MODEL CONFIGURATION
+#  MODEL CONFIGURATION (Roboflow hosted — see core/inference.py)
 # ═════════════════════════════════════════════════════════
 
-MODEL_PATH = "weights-6.pt"
 
 
 class InFacApp(tk.Tk):
@@ -60,7 +59,7 @@ class InFacApp(tk.Tk):
 
         # ── State ────────────────────────────────────────
         self.camera = CameraManager()
-        self.inference = InferenceEngine(MODEL_PATH)
+        self.inference = InferenceEngine()
         self.inspection = InspectionManager()
         
         self.inspection.on_log_result = self._add_log_entry
@@ -850,6 +849,5 @@ class InFacApp(tk.Tk):
 
     def _on_close(self):
         self.camera.is_running = False
-        if self.cap:
-            self.cap.release()
+        self.camera.stop()
         self.destroy()
