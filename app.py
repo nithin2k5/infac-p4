@@ -13,6 +13,8 @@ import queue
 import base64
 import io
 import os
+import sys
+import subprocess
 
 from core.camera import CameraManager
 from core.inference import InferenceEngine
@@ -70,6 +72,9 @@ class InFacApp(tk.Tk):
         self.detection_log_items = []
         self.confidence_threshold = 0.65
         self._photo_ref = None
+        self._glow_job = None
+        self._glow_state = False
+        self._last_result_state = None  # "pass", "ng", or None
 
         threading.Thread(target=self.inference.load_model, daemon=True).start()
 
@@ -536,25 +541,36 @@ class InFacApp(tk.Tk):
         
         # Pass to inspection logic for glowing PASS/FAIL indicators and Auto-Inspect
         pcb_detected, solder_count = self.inspection.process_live_frame(predictions)
-        
+
         if pcb_detected or solder_count > 0:
             if solder_count >= 2:
-                self.pass_frame.configure(bg=Colors.SUCCESS)
-                self.pass_label.configure(bg=Colors.SUCCESS, fg=Colors.BG_DARKEST)
-                self.ng_frame.configure(bg=Colors.BG_MEDIUM)
-                self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+                # PASS — start green glow if not already in PASS state
+                if self._last_result_state != "pass":
+                    self._last_result_state = "pass"
+                    # Reset NG label to idle
+                    self.ng_frame.configure(bg=Colors.BG_MEDIUM)
+                    self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+                    self._start_pass_glow()
                 self.model_status_label.configure(text="● PASS - Detected", fg=Colors.SUCCESS)
             else:
-                self.pass_frame.configure(bg=Colors.BG_MEDIUM)
-                self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
-                self.ng_frame.configure(bg=Colors.DANGER)
-                self.ng_label.configure(bg=Colors.DANGER, fg=Colors.TEXT_PRIMARY)
+                # NG — start red glow and play alarm on state transition
+                if self._last_result_state != "ng":
+                    self._last_result_state = "ng"
+                    # Reset PASS label to idle
+                    self.pass_frame.configure(bg=Colors.BG_MEDIUM)
+                    self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+                    self._start_ng_glow()
+                    self._play_alarm_sound()
                 self.model_status_label.configure(text="● NG - Inspecting", fg=Colors.DANGER)
         else:
-            self.pass_frame.configure(bg=Colors.BG_MEDIUM)
-            self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
-            self.ng_frame.configure(bg=Colors.BG_MEDIUM)
-            self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+            # No detection — reset both labels to idle
+            if self._last_result_state is not None:
+                self._last_result_state = None
+                self._stop_glow()
+                self.pass_frame.configure(bg=Colors.BG_MEDIUM)
+                self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+                self.ng_frame.configure(bg=Colors.BG_MEDIUM)
+                self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
             self.model_status_label.configure(text="● Detecting", fg=Colors.SUCCESS)
 
     def _on_auto_toggle(self):
@@ -847,7 +863,79 @@ class InFacApp(tk.Tk):
         c.create_text(w//2, h//2 + 45, text='Click "Start Camera" to begin',
                       font=Fonts.SMALL, fill=Colors.TEXT_MUTED)
 
+    def _play_alarm_sound(self):
+        """Play an alarm sound in a background thread (non-blocking)."""
+        def _play():
+            try:
+                if sys.platform == "win32":
+                    import winsound
+                    for _ in range(3):
+                        winsound.Beep(1000, 200)
+                        time.sleep(0.1)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(
+                        ["afplay", "/System/Library/Sounds/Basso.aiff"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                else:
+                    subprocess.Popen(
+                        ["paplay", "/usr/share/sounds/freedesktop/stereo/dialog-warning.oga"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+            except Exception:
+                pass
+        threading.Thread(target=_play, daemon=True).start()
+
+    def _stop_glow(self):
+        """Cancel any running glow animation."""
+        if self._glow_job is not None:
+            self.after_cancel(self._glow_job)
+            self._glow_job = None
+
+    def _start_pass_glow(self):
+        """Pulse the PASS label with a green glow effect."""
+        self._stop_glow()
+        bright = Colors.SUCCESS       # #3fb950
+        dim    = Colors.SUCCESS_DIM   # #238636
+        text_bright = Colors.BG_DARKEST
+        text_dim    = "#c3e6cb"
+
+        def _tick():
+            self._glow_state = not self._glow_state
+            color = bright if self._glow_state else dim
+            txt   = text_bright if self._glow_state else text_dim
+            try:
+                self.pass_frame.configure(bg=color)
+                self.pass_label.configure(bg=color, fg=txt)
+            except tk.TclError:
+                return
+            self._glow_job = self.after(500, _tick)
+
+        _tick()
+
+    def _start_ng_glow(self):
+        """Pulse the NG label with a red glow effect."""
+        self._stop_glow()
+        bright = Colors.DANGER      # #f85149
+        dim    = Colors.DANGER_DIM  # #da3633
+        text_bright = Colors.TEXT_PRIMARY
+        text_dim    = "#ffc8c8"
+
+        def _tick():
+            self._glow_state = not self._glow_state
+            color = bright if self._glow_state else dim
+            txt   = text_bright if self._glow_state else text_dim
+            try:
+                self.ng_frame.configure(bg=color)
+                self.ng_label.configure(bg=color, fg=txt)
+            except tk.TclError:
+                return
+            self._glow_job = self.after(500, _tick)
+
+        _tick()
+
     def _on_close(self):
+        self._stop_glow()
         self.camera.is_running = False
         self.camera.stop()
         self.destroy()
