@@ -67,14 +67,20 @@ class InFacApp(tk.Tk):
         self.inspection.on_log_result = self._add_log_entry
         self.inspection.on_stats_update = self._update_stats_ui
 
-        self.is_detecting = False
+        self.is_detecting = False        # used only for video-file playback
         self.current_detections = []
         self.detection_log_items = []
         self.confidence_threshold = 0.65
         self._photo_ref = None
         self._glow_job = None
         self._glow_state = False
-        self._last_result_state = None  # "pass", "ng", or None
+        self._last_result_state = None   # "pass", "ng", or None
+
+        # Timed-capture cycle state
+        self._cycle_phase = "idle"       # "idle" | "countdown" | "capturing" | "result"
+        self._countdown_remaining = 0
+        self._countdown_job = None
+        self._result_frame = None        # annotated BGR frame shown during result phase
 
         threading.Thread(target=self.inference.load_model, daemon=True).start()
 
@@ -281,13 +287,21 @@ class InFacApp(tk.Tk):
         self.cam_combo.set("Camera 0")
         self.cam_combo.pack(fill="x", pady=(4, 0))
 
-        # Auto-Inspect
-        auto_frame = tk.Frame(parent, bg=Colors.BG_CARD)
-        auto_frame.pack(fill="x", padx=16, pady=(4, 8))
-        tk.Label(auto_frame, text="Auto-Inspect", font=Fonts.SMALL_BOLD, bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY).pack(side="left")
-        self.auto_var = tk.BooleanVar(value=False)
-        auto_cb = ttk.Checkbutton(auto_frame, variable=self.auto_var, command=self._on_auto_toggle)
-        auto_cb.pack(side="right")
+        # Capture Delay slider
+        cap_frame = tk.Frame(parent, bg=Colors.BG_CARD)
+        cap_frame.pack(fill="x", padx=16, pady=(4, 8))
+        cap_top = tk.Frame(cap_frame, bg=Colors.BG_CARD)
+        cap_top.pack(fill="x")
+        tk.Label(cap_top, text="Capture Delay (s)", font=Fonts.SMALL_BOLD,
+                 bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY).pack(side="left")
+        self.capture_delay_var = tk.IntVar(value=3)
+        self.capture_delay_display = tk.Label(cap_top, text="3s", font=Fonts.MONO_SMALL,
+                                               bg=Colors.BG_CARD, fg=Colors.PRIMARY)
+        self.capture_delay_display.pack(side="right")
+        ttk.Scale(cap_frame, from_=1, to=10, variable=self.capture_delay_var,
+                  orient="horizontal",
+                  command=lambda v: self.capture_delay_display.configure(
+                      text=f"{int(float(v))}s")).pack(fill="x", pady=(4, 0))
         
         # ROI Crop slider (Vertical height crop)
         roi_frame = tk.Frame(parent, bg=Colors.BG_CARD)
@@ -357,18 +371,16 @@ class InFacApp(tk.Tk):
 
     def _toggle_camera(self):
         if self.camera.is_paused:
-            # Resume from paused state
-            self.is_paused = False
-            self.is_detecting = True  # Auto-resume detection
+            # Resume from paused/test state — restart capture cycle
             self.cam_status_label.configure(text="● Camera Connected", fg=Colors.SUCCESS)
-            self.model_status_label.configure(text="● Detecting", fg=Colors.SUCCESS)
             self.start_btn.itemconfig(self.start_btn._text_id, text="⏹  Stop Camera")
             self.start_btn.bg_color = Colors.DANGER_DIM
             self.start_btn.hover_color = Colors.DANGER
             self.start_btn.itemconfig(self.start_btn._bg_id, fill=Colors.DANGER_DIM)
             self.camera_canvas.unbind("<Configure>")
             self.camera.is_paused = False
-            self.is_detecting = True
+            self._update_frame()
+            self._start_countdown()
         elif self.camera.is_running:
             self._stop_camera()
         else:
@@ -393,23 +405,24 @@ class InFacApp(tk.Tk):
         self._static_frame = None
         self._static_predictions = []
         self.camera_canvas.unbind("<Configure>")
-        
-        self.is_detecting = True
+
+        self.is_detecting = False  # live camera uses capture cycle, not continuous inference
         self.cam_status_label.configure(text="● Camera Connected", fg=Colors.SUCCESS)
-        self.model_status_label.configure(text="● Detecting", fg=Colors.SUCCESS)
-        
+
         self.start_btn.itemconfig(self.start_btn._text_id, text="⏹  Stop Camera")
         self.start_btn.bg_color = Colors.DANGER_DIM
         self.start_btn.hover_color = Colors.DANGER
         self.start_btn.itemconfig(self.start_btn._bg_id, fill=Colors.DANGER_DIM)
-        
+
         self.res_label.configure(text=f"{w} × {h}")
         self._detect_interval = 0
         self._inference_busy = False
-        
+
         self._update_frame()
+        self._start_countdown()
 
     def _stop_camera(self):
+        self._stop_capture_cycle()
         self.camera.is_running = False
         self.is_detecting = False
         self.camera.stop()
@@ -433,8 +446,15 @@ class InFacApp(tk.Tk):
         self._update_result_indicators([])
 
     def _update_frame(self):
+        # ── Result phase: show frozen annotated capture ──
+        if self._cycle_phase == "result" and self._result_frame is not None:
+            self._show_frame_on_canvas(self._result_frame)
+            if self.camera.is_running:
+                self.after(33, self._update_frame)
+            return
+
         frame, is_end = self.camera.read_frame()
-        
+
         if is_end:
             self._stop_camera()
             self.cam_status_label.configure(text="● Video Ended", fg=Colors.TEXT_MUTED)
@@ -446,90 +466,85 @@ class InFacApp(tk.Tk):
             return
 
         self.current_frame = frame.copy()
-        
+
         self.fps_label.configure(text=f"FPS: {self.camera.fps:.1f}")
         self.stat_labels["fps_stat_val"].configure(text=f"{self.camera.fps:.0f}")
         self.frame_label.configure(text=f"Frame: {self.camera.frame_count:,}")
 
-        # Provide ROI to inference based on slider
-        roi_scale = self.roi_var.get()
         h_frame, w_frame = frame.shape[:2]
-        new_w, new_h = int(w_frame * roi_scale), int(h_frame * roi_scale)
-        rx, ry = (w_frame - new_w) // 2, (h_frame - new_h) // 2
-        
-        roi = None if roi_scale >= 0.99 else (rx, ry, new_w, new_h)
+        display_frame = frame.copy()
 
+        # ── ROI overlay ───────────────────────────────────
+        roi_scale = self.roi_var.get()
+        if roi_scale < 0.99:
+            new_w_roi = int(w_frame * roi_scale)
+            new_h_roi = int(h_frame * roi_scale)
+            rx = (w_frame - new_w_roi) // 2
+            ry = (h_frame - new_h_roi) // 2
+            roi = (rx, ry, new_w_roi, new_h_roi)
+            cv2.rectangle(display_frame, (rx, ry), (rx + new_w_roi, ry + new_h_roi),
+                          (255, 255, 255), 2, cv2.LINE_DASH)
+            cv2.putText(display_frame, "ROI", (rx + 6, ry + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        else:
+            roi = None
+
+        # ── Video-file mode: continuous inference ─────────
         if self.is_detecting:
             self._detect_interval += 1
             if self._detect_interval >= 2 and not getattr(self, '_inference_busy', False):
                 self._detect_interval = 0
                 self._inference_busy = True
-                
-                # Run inference in background
                 def _bg_infer():
                     preds = self.inference.infer(frame.copy(), self.confidence_threshold, roi)
                     self.after(0, self._on_live_inference_result, preds)
-                
                 threading.Thread(target=_bg_infer, daemon=True).start()
 
-        display_frame = frame.copy()
-
-        # Draw ROI Box if scaled
-        if roi:
-            cv2.rectangle(display_frame, (rx, ry), (rx + new_w, ry + new_h), (255, 255, 255), 2, cv2.LINE_DASH)
-            cv2.putText(display_frame, "ROI Mask", (rx + 5, ry + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-        if self.is_detecting:
             dets = list(self.current_detections)
-            for det in dets:
-                x1 = int(det["x"] - det["width"] / 2)
-                y1 = int(det["y"] - det["height"] / 2)
-                x2 = int(det["x"] + det["width"] / 2)
-                y2 = int(det["y"] + det["height"] / 2)
-                conf = det["confidence"]
-                cls_name = det["class"]
-                color_bgr = (0, 255, 0) if conf >= 0.8 else (0, 255, 255) if conf >= 0.5 else (0, 0, 255)
-                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color_bgr, 3)
-                
-                # Bold corner accents
-                corner_len = min(20, min(max(1, x2-x1), max(1, y2-y1)) // 3)
-                for cx, cy, dx, dy in [(x1, y1, 1, 1), (x2, y1, -1, 1),
-                                        (x1, y2, 1, -1), (x2, y2, -1, -1)]:
-                    cv2.line(display_frame, (cx, cy), (cx + corner_len*dx, cy), color_bgr, 4)
-                    cv2.line(display_frame, (cx, cy), (cx, cy + corner_len*dy), color_bgr, 4)
-
-                label_text = f"{cls_name} {conf:.0%}"
-                (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-                cv2.rectangle(display_frame, (x1, y1 - th - 14), (x1 + tw + 14, y1), color_bgr, -1)
-                cv2.putText(display_frame, label_text, (x1 + 7, y1 - 7),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
-
-            cx, cy = w_frame // 2, h_frame // 2
-            cv2.line(display_frame, (cx-20, cy), (cx+20, cy), (88, 166, 255), 1)
-            cv2.line(display_frame, (cx, cy-20), (cx, cy+20), (88, 166, 255), 1)
-
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            cv2.putText(display_frame, ts, (10, h_frame - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (138, 148, 158), 1)
-
+            self._draw_detections_on_frame(display_frame, dets)
             cv2.circle(display_frame, (w_frame - 30, 25), 8, (0, 0, 255), -1)
             cv2.putText(display_frame, "DETECTING", (w_frame - 130, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-        rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-        canvas_w = self.camera_canvas.winfo_width()
-        canvas_h = self.camera_canvas.winfo_height()
-        if canvas_w > 10 and canvas_h > 10:
-            img_w, img_h = img.size
-            scale = min(canvas_w / img_w, canvas_h / img_h)
-            new_w, new_h = int(img_w * scale), int(img_h * scale)
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-        photo = ImageTk.PhotoImage(image=img)
-        self._photo_ref = photo
-        self.camera_canvas.delete("all")
-        self.camera_canvas.create_image(canvas_w // 2, canvas_h // 2,
-                                         image=photo, anchor="center")
+        # Crosshair
+        cv2.line(display_frame, (w_frame//2 - 20, h_frame//2),
+                 (w_frame//2 + 20, h_frame//2), (88, 166, 255), 1)
+        cv2.line(display_frame, (w_frame//2, h_frame//2 - 20),
+                 (w_frame//2, h_frame//2 + 20), (88, 166, 255), 1)
+
+        # Timestamp
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cv2.putText(display_frame, ts, (10, h_frame - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (138, 148, 158), 1)
+
+        # ── Countdown overlay (live camera capture cycle) ─
+        if self._cycle_phase == "countdown" and self._countdown_remaining > 0:
+            num = str(self._countdown_remaining)
+            fs, th = 5.0, 10
+            (tw, _th), _ = cv2.getTextSize(num, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+            tx = (w_frame - tw) // 2
+            ty = (h_frame + _th) // 2
+            # Shadow
+            cv2.putText(display_frame, num, (tx + 4, ty + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), th + 4, cv2.LINE_AA)
+            # Number
+            cv2.putText(display_frame, num, (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, fs, (88, 166, 255), th, cv2.LINE_AA)
+            # Label above
+            lbl = "CAPTURING IN"
+            (lw, _), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+            cv2.putText(display_frame, lbl, ((w_frame - lw) // 2, ty - _th - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 200, 200), 2, cv2.LINE_AA)
+
+        elif self._cycle_phase == "capturing":
+            cv2.rectangle(display_frame, (0, 0), (w_frame, h_frame), (88, 166, 255), 8)
+            snap_txt = "CAPTURING..."
+            (tw, _th), _ = cv2.getTextSize(snap_txt, cv2.FONT_HERSHEY_SIMPLEX, 1.6, 3)
+            cv2.putText(display_frame, snap_txt,
+                        ((w_frame - tw) // 2, (h_frame + _th) // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.6, (88, 166, 255), 3, cv2.LINE_AA)
+
+        self._show_frame_on_canvas(display_frame)
         self.after(15, self._update_frame)
 
     def _on_live_inference_result(self, predictions):
@@ -573,8 +588,178 @@ class InFacApp(tk.Tk):
                 self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
             self.model_status_label.configure(text="● Detecting", fg=Colors.SUCCESS)
 
-    def _on_auto_toggle(self):
-        self.inspection.auto_inspect_enabled = self.auto_var.get()
+    # ═════════════════════════════════════════════════════
+    #  TIMED CAPTURE CYCLE
+    # ═════════════════════════════════════════════════════
+
+    def _start_countdown(self):
+        """Begin a fresh countdown before the next auto-capture."""
+        self._stop_capture_cycle()
+        delay = int(self.capture_delay_var.get())
+        self._countdown_remaining = delay
+        self._cycle_phase = "countdown"
+        self.model_status_label.configure(
+            text=f"● Capturing in {delay}s...", fg=Colors.WARNING)
+        # Reset indicators to idle before next shot
+        self._stop_glow()
+        self._last_result_state = None
+        self.pass_frame.configure(bg=Colors.BG_MEDIUM)
+        self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+        self.ng_frame.configure(bg=Colors.BG_MEDIUM)
+        self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+        self._tick_countdown()
+
+    def _tick_countdown(self):
+        if not self.camera.is_running or self._cycle_phase != "countdown":
+            return
+        if self._countdown_remaining <= 0:
+            self._do_capture()
+            return
+        self.model_status_label.configure(
+            text=f"● Capturing in {self._countdown_remaining}s...", fg=Colors.WARNING)
+        self._countdown_remaining -= 1
+        self._countdown_job = self.after(1000, self._tick_countdown)
+
+    def _do_capture(self):
+        """Freeze the current frame and run inference on it."""
+        if not self.camera.is_running:
+            return
+        if not hasattr(self, 'current_frame') or self.current_frame is None:
+            self._countdown_job = self.after(100, self._do_capture)
+            return
+
+        self._cycle_phase = "capturing"
+        self.model_status_label.configure(text="● Capturing...", fg=Colors.PRIMARY)
+
+        captured = self.current_frame.copy()
+        h_img, w_img = captured.shape[:2]
+        roi_scale = self.roi_var.get()
+        roi = None if roi_scale >= 0.99 else (
+            (w_img - int(w_img * roi_scale)) // 2,
+            (h_img - int(h_img * roi_scale)) // 2,
+            int(w_img * roi_scale),
+            int(h_img * roi_scale)
+        )
+
+        def _bg():
+            if not self.inference.is_loaded():
+                self.after(0, lambda: self.model_status_label.configure(
+                    text="● Model not loaded", fg=Colors.DANGER))
+                self.after(1500, self._start_countdown)
+                return
+            try:
+                preds = self.inference.infer(captured, self.confidence_threshold, roi)
+                self.after(0, self._on_capture_done, captured, preds)
+            except Exception as e:
+                print(f"Capture inference error: {e}")
+                self.after(0, lambda: self.model_status_label.configure(
+                    text="● Inference Error", fg=Colors.DANGER))
+                self.after(1500, self._start_countdown)
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _on_capture_done(self, frame, predictions):
+        """Handle inference result: show annotated freeze frame + PASS/NG."""
+        if not self.camera.is_running:
+            return
+
+        # Build annotated result frame
+        annotated = frame.copy()
+        self._draw_detections_on_frame(annotated, predictions)
+
+        # Stamp result text on frame
+        h_img, w_img = annotated.shape[:2]
+        ts = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+        is_pass = self.inspection.process_test_snapshot(predictions, "Auto-capture")
+        result_text = "PASS" if is_pass else "NG"
+        result_color = (63, 185, 80) if is_pass else (248, 81, 73)   # BGR
+        fs, th = 3.0, 6
+        (tw, _th), _ = cv2.getTextSize(result_text, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+        cv2.putText(annotated, result_text,
+                    ((w_img - tw) // 2, h_img - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), th + 4, cv2.LINE_AA)
+        cv2.putText(annotated, result_text,
+                    ((w_img - tw) // 2, h_img - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs, result_color, th, cv2.LINE_AA)
+        cv2.putText(annotated, ts, (10, h_img - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+
+        self._result_frame = annotated
+        self._cycle_phase = "result"
+
+        if is_pass:
+            self.ng_frame.configure(bg=Colors.BG_MEDIUM)
+            self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+            self._last_result_state = "pass"
+            self._start_pass_glow()
+            self.model_status_label.configure(text="● PASS", fg=Colors.SUCCESS)
+        else:
+            self.pass_frame.configure(bg=Colors.BG_MEDIUM)
+            self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+            self._last_result_state = "ng"
+            self._start_ng_glow()
+            self._play_alarm_sound()
+            self.model_status_label.configure(text="● NG — Defect Detected", fg=Colors.DANGER)
+
+        # Show result for 3 seconds, then start next cycle
+        self._countdown_job = self.after(3000, self._start_countdown)
+
+    def _stop_capture_cycle(self):
+        """Cancel any pending countdown or capture job."""
+        if self._countdown_job is not None:
+            self.after_cancel(self._countdown_job)
+            self._countdown_job = None
+        self._cycle_phase = "idle"
+        self._result_frame = None
+        self._countdown_remaining = 0
+
+    def _show_frame_on_canvas(self, frame_bgr):
+        """Convert a BGR numpy frame and display it on the camera canvas."""
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb)
+        canvas_w = self.camera_canvas.winfo_width()
+        canvas_h = self.camera_canvas.winfo_height()
+        if canvas_w > 10 and canvas_h > 10:
+            img_w, img_h = img.size
+            scale = min(canvas_w / img_w, canvas_h / img_h)
+            new_w, new_h = int(img_w * scale), int(img_h * scale)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(image=img)
+        self._photo_ref = photo
+        self.camera_canvas.delete("all")
+        self.camera_canvas.create_image(canvas_w // 2, canvas_h // 2,
+                                         image=photo, anchor="center")
+
+    def _draw_detections_on_frame(self, frame, predictions):
+        """Draw bounding boxes and labels onto a BGR frame in-place."""
+        for det in predictions:
+            x1 = int(det["x"] - det["width"] / 2)
+            y1 = int(det["y"] - det["height"] / 2)
+            x2 = int(det["x"] + det["width"] / 2)
+            y2 = int(det["y"] + det["height"] / 2)
+            conf = det["confidence"]
+            cls_name = det["class"]
+            color_bgr = (0, 255, 0) if conf >= 0.8 else (0, 255, 255) if conf >= 0.5 else (0, 0, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color_bgr, 3)
+            corner_len = min(20, min(max(1, x2 - x1), max(1, y2 - y1)) // 3)
+            for cx, cy, dx, dy in [(x1, y1, 1, 1), (x2, y1, -1, 1),
+                                    (x1, y2, 1, -1), (x2, y2, -1, -1)]:
+                cv2.line(frame, (cx, cy), (cx + corner_len * dx, cy), color_bgr, 4)
+                cv2.line(frame, (cx, cy), (cx, cy + corner_len * dy), color_bgr, 4)
+            label_text = f"{cls_name} {conf:.0%}"
+            (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(frame, (x1, y1 - th - 14), (x1 + tw + 14, y1), color_bgr, -1)
+            cv2.putText(frame, label_text, (x1 + 7, y1 - 7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
+
+    def _update_result_indicators(self, _predictions):
+        """Reset PASS/NG labels to idle state."""
+        self._stop_glow()
+        self._last_result_state = None
+        self.pass_frame.configure(bg=Colors.BG_MEDIUM)
+        self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+        self.ng_frame.configure(bg=Colors.BG_MEDIUM)
+        self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
 
     def _upload_media(self):
         """Open a file dialog to upload an image or video for detection testing."""
@@ -697,22 +882,7 @@ class InFacApp(tk.Tk):
             cv2.putText(frame, label_text, (x1+7, y1-7),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-
-        canvas_w = self.camera_canvas.winfo_width()
-        canvas_h = self.camera_canvas.winfo_height()
-        if canvas_w > 10 and canvas_h > 10:
-            img_w, img_h = img.size
-            scale = min(canvas_w / img_w, canvas_h / img_h)
-            new_w, new_h = int(img_w * scale), int(img_h * scale)
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-
-        photo = ImageTk.PhotoImage(image=img)
-        self._photo_ref = photo
-        self.camera_canvas.delete("all")
-        self.camera_canvas.create_image(canvas_w // 2, canvas_h // 2,
-                                         image=photo, anchor="center")
+        self._show_frame_on_canvas(frame)
 
     def _test_detect(self):
         if self.current_frame is None:
@@ -721,11 +891,12 @@ class InFacApp(tk.Tk):
         frame = self.current_frame.copy()
 
         if self.camera.is_running:
+            # Stop capture cycle and pause camera
+            self._stop_capture_cycle()
             self.camera.is_paused = True
-            if self.is_detecting:
-                self.is_detecting = False
-                self.model_status_label.configure(text="● Model Paused", fg=Colors.WARNING)
-                self.current_detections = []
+            self.is_detecting = False
+            self.current_detections = []
+            self.model_status_label.configure(text="● Model Paused", fg=Colors.WARNING)
 
             self.start_btn.itemconfig(self.start_btn._text_id, text="▶  Resume Camera")
             self.start_btn.bg_color = Colors.SUCCESS_DIM
