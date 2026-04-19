@@ -8,9 +8,9 @@ import numpy as np
 #  ROBOFLOW HOSTED INFERENCE
 # ═════════════════════════════════════════════════════════
 
-ROBOFLOW_API_KEY = "cf7X6JDorlmwhw6aqKUK"
-ROBOFLOW_MODEL = "p4-kbph4"
-ROBOFLOW_VERSION = "9"
+ROBOFLOW_API_KEY = "o9B6SxZWqN5tFwRtIfRO"
+ROBOFLOW_MODEL = "my-first-project-gfysj"
+ROBOFLOW_VERSION = "4"
 ROBOFLOW_URL = (
     f"https://detect.roboflow.com/{ROBOFLOW_MODEL}/{ROBOFLOW_VERSION}"
 )
