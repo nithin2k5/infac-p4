@@ -3,7 +3,7 @@ InFac P4 — Industrial Inspection System
 Entry point for the desktop application.
 
 Requirements:
-    pip install opencv-python Pillow requests ultralytics
+    pip install opencv-python Pillow requests numpy pymodbus
 """
 
 import sys
@@ -28,6 +28,10 @@ def check_dependencies():
         import numpy
     except ImportError:
         missing.append("numpy")
+    try:
+        import pymodbus
+    except ImportError:
+        missing.append("pymodbus")
 
     if missing:
         print(f"Missing dependencies: {', '.join(missing)}")
