@@ -18,13 +18,21 @@ except ImportError:
 class PLCManager:
     """Delta PLC communication via Modbus TCP.
 
-    Delta DVP/AS coil layout (configurable):
-      trigger_coil — PLC sets this to 1 to request an inspection
-      pass_coil    — App sets this to 1 after a PASS result
-      ng_coil      — App sets this to 1 after an NG result
+    Signal flow:
+      1. User clicks "Send HIGH" in the app.
+      2. App writes signal_coil HIGH  →  PLC sees it and starts its
+         response sequence (e.g. physically positions the camera or
+         simply latches the trigger).
+      3. PLC writes trigger_coil HIGH  →  poll thread detects it,
+         clears it, and fires on_trigger().
+      4. App captures the current frame and runs solder inspection.
+      5. App writes pass_coil or ng_coil based on the result.
 
-    Default coil numbers map to M0/M1/M2 on Delta DVP series.
-    Users can override via the UI.
+    Default Modbus coil addresses (Delta DVP M-registers):
+      signal_coil  M0 — App writes HIGH when user presses "Send HIGH"
+      trigger_coil M1 — PLC writes HIGH to command a capture
+      pass_coil    M2 — App writes HIGH after PASS
+      ng_coil      M3 — App writes HIGH after NG
     """
 
     def __init__(self):
@@ -33,9 +41,10 @@ class PLCManager:
         self.port = 502
 
         # Modbus coil addresses (user-configurable via UI)
-        self.trigger_coil = 0   # M0 — PLC writes 1 here to trigger capture
-        self.pass_coil    = 1   # M1 — App writes 1 here after PASS
-        self.ng_coil      = 2   # M2 — App writes 1 here after NG
+        self.signal_coil  = 0   # M0 — user-driven HIGH signal to PLC
+        self.trigger_coil = 1   # M1 — PLC writes HIGH to request capture
+        self.pass_coil    = 2   # M2 — App writes after PASS
+        self.ng_coil      = 3   # M3 — App writes after NG
 
         self.is_connected = False
 
@@ -43,9 +52,9 @@ class PLCManager:
         self._stop_poll = threading.Event()
 
         # Callbacks
-        self.on_trigger = None       # () — called when PLC trigger fires
-        self.on_connect = None       # () — called on successful connect
-        self.on_disconnect = None    # () — called on disconnect/error
+        self.on_trigger    = None   # () — called when PLC trigger fires
+        self.on_connect    = None   # () — called on successful connect
+        self.on_disconnect = None   # () — called on disconnect/error
 
     @staticmethod
     def available():
@@ -82,6 +91,35 @@ class PLCManager:
         self.is_connected = False
         if self.on_disconnect:
             self.on_disconnect()
+
+    # ── User Signal ─────────────────────────────────────────
+
+    def send_signal_high(self):
+        """Write signal_coil HIGH — called when user presses 'Send HIGH'.
+
+        The PLC should react to this rising edge by executing whatever
+        preparation logic it needs and then asserting trigger_coil to
+        request a solder-inspection capture from the app.
+        """
+        if not self.is_connected or not self.client:
+            return
+        try:
+            self.client.write_coil(self.signal_coil, True)
+            print(f"[PLC] Signal coil M{self.signal_coil} → HIGH (user triggered)")
+        except Exception as e:
+            print(f"[PLC] send_signal_high error: {e}")
+            self._handle_comm_error()
+
+    def send_signal_low(self):
+        """Write signal_coil LOW — reset after PLC has acknowledged."""
+        if not self.is_connected or not self.client:
+            return
+        try:
+            self.client.write_coil(self.signal_coil, False)
+            print(f"[PLC] Signal coil M{self.signal_coil} → LOW")
+        except Exception as e:
+            print(f"[PLC] send_signal_low error: {e}")
+            self._handle_comm_error()
 
     # ── Write results ────────────────────────────────────────
 
@@ -131,6 +169,9 @@ class PLCManager:
                 if result and not result.isError() and result.bits[0]:
                     # Acknowledge by clearing the trigger coil
                     self.client.write_coil(self.trigger_coil, False)
+                    # Also reset the signal coil — PLC has acknowledged
+                    self.send_signal_low()
+                    print("[PLC] Trigger coil fired — requesting capture")
                     if self.on_trigger:
                         self.on_trigger()
             except Exception as e:

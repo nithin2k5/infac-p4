@@ -225,6 +225,13 @@ class InFacApp(tk.Tk):
             hover_color=Colors.BG_CARD_HOVER, width=130, height=40,
             command=self._reset_stats, font=Fonts.BUTTON).pack(side="left", padx=4)
 
+        # ── Send HIGH button (Actual mode + PLC connected only) ──
+        self.send_high_btn = StyledButton(
+            inner, text="⚡  Send HIGH", bg_color="#7c3aed",
+            hover_color="#9d5cf0", width=140, height=40,
+            command=self._send_plc_high, font=Fonts.BUTTON)
+        # Hidden by default; shown when PLC connects in Actual mode
+
     def _build_stats_row(self, parent):
         """Stats cards row below controls."""
         stats = tk.Frame(parent, bg=Colors.BG_DARK)
@@ -325,9 +332,13 @@ class InFacApp(tk.Tk):
         # Coil address row
         coil_row = tk.Frame(self._plc_frame, bg=Colors.BG_CARD)
         coil_row.pack(fill="x", pady=(2, 4))
-        for lbl, attr in [("Trig M", "_plc_trig_var"), ("Pass M", "_plc_pass_var"), ("NG M", "_plc_ng_var")]:
-            default = str({"_plc_trig_var": 0, "_plc_pass_var": 1, "_plc_ng_var": 2}[attr])
-            setattr(self, attr, tk.StringVar(value=default))
+        for lbl, attr, default_val in [
+            ("Sig M",  "_plc_sig_var",  0),
+            ("Trig M", "_plc_trig_var", 1),
+            ("Pass M", "_plc_pass_var", 2),
+            ("NG M",   "_plc_ng_var",   3),
+        ]:
+            setattr(self, attr, tk.StringVar(value=str(default_val)))
             tk.Label(coil_row, text=lbl, font=Fonts.TINY, bg=Colors.BG_CARD,
                      fg=Colors.TEXT_MUTED).pack(side="left", padx=(0, 2))
             tk.Entry(coil_row, textvariable=getattr(self, attr), font=Fonts.SMALL,
@@ -490,7 +501,9 @@ class InFacApp(tk.Tk):
         self._static_predictions = []
         self.camera_canvas.unbind("<Configure>")
 
-        self.is_detecting = False  # live camera uses capture cycle, not continuous inference
+        # Simulation mode: timed capture cycle.
+        # Actual mode: live feed only — capture is driven by PLC trigger.
+        self.is_detecting = False
         self.cam_status_label.configure(text="● Camera Connected", fg=Colors.SUCCESS)
 
         self.start_btn.itemconfig(self.start_btn._text_id, text="⏹  Stop Camera")
@@ -503,7 +516,12 @@ class InFacApp(tk.Tk):
         self._inference_busy = False
 
         self._update_frame()
-        self._start_countdown()
+        if self._mode != "actual":
+            self._start_countdown()
+        else:
+            self._cycle_phase = "idle"
+            self.model_status_label.configure(
+                text="● Ready — press 'Send HIGH' to signal PLC", fg=Colors.TEXT_MUTED)
 
     def _stop_camera(self):
         self._stop_capture_cycle()
@@ -635,9 +653,9 @@ class InFacApp(tk.Tk):
         self._inference_busy = False
         if not self.is_detecting:
             return
-            
+
         self.current_detections = predictions
-        
+
         # Pass to inspection logic for glowing PASS/FAIL indicators and Auto-Inspect
         pcb_detected, solder_count = self.inspection.process_live_frame(predictions)
 
@@ -1242,9 +1260,10 @@ class InFacApp(tk.Tk):
             try:
                 host = self._plc_ip_var.get().strip()
                 port = int(self._plc_port_var.get().strip() or "502")
-                self.plc.trigger_coil = int(self._plc_trig_var.get() or "0")
-                self.plc.pass_coil    = int(self._plc_pass_var.get() or "1")
-                self.plc.ng_coil      = int(self._plc_ng_var.get() or "2")
+                self.plc.signal_coil  = int(self._plc_sig_var.get()  or "0")
+                self.plc.trigger_coil = int(self._plc_trig_var.get() or "1")
+                self.plc.pass_coil    = int(self._plc_pass_var.get() or "2")
+                self.plc.ng_coil      = int(self._plc_ng_var.get()   or "3")
                 ok = self.plc.connect(host, port)
                 if not ok:
                     self.after(0, self._on_plc_connect_failed)
@@ -1268,6 +1287,11 @@ class InFacApp(tk.Tk):
         self._plc_connect_btn.itemconfig(self._plc_connect_btn._bg_id, fill=Colors.DANGER_DIM)
         # Start polling for PLC trigger
         self.plc.start_trigger_poll()
+        # Show the Send HIGH button
+        self.send_high_btn.pack(side="left", padx=4)
+        if self.camera.is_running and self._mode == "actual":
+            self.model_status_label.configure(
+                text="● Ready — press 'Send HIGH' to signal PLC", fg=Colors.TEXT_MUTED)
 
     def _on_plc_connect_failed(self):
         self._plc_status_label.configure(text="● Failed", fg=Colors.DANGER)
@@ -1285,23 +1309,56 @@ class InFacApp(tk.Tk):
         self._plc_connect_btn.bg_color = Colors.SUCCESS_DIM
         self._plc_connect_btn.hover_color = Colors.SUCCESS
         self._plc_connect_btn.itemconfig(self._plc_connect_btn._bg_id, fill=Colors.SUCCESS_DIM)
+        # Hide the Send HIGH button
+        self.send_high_btn.pack_forget()
+
+    def _send_plc_high(self):
+        """User-driven: write signal coil HIGH, then wait for PLC trigger."""
+        if not self.plc.is_connected:
+            return
+        if self._cycle_phase in ("capturing", "result"):
+            return  # already busy
+        if not self.camera.is_running:
+            self.model_status_label.configure(
+                text="● Start camera first", fg=Colors.DANGER)
+            return
+        # Visually indicate signal has been sent
+        self.send_high_btn.itemconfig(
+            self.send_high_btn._text_id, text="⏳  Waiting...")
+        self.model_status_label.configure(
+            text="● Signal HIGH sent — waiting for PLC trigger", fg=Colors.WARNING)
+        # Write HIGH in a background thread (non-blocking)
+        threading.Thread(target=self.plc.send_signal_high, daemon=True).start()
 
     def _on_plc_trigger(self):
-        """Called from PLC poll thread when trigger coil fires — run capture on main thread."""
+        """Called from PLC poll thread when trigger coil fires — schedule capture on main thread."""
         self.after(0, self._plc_triggered_capture)
 
     def _plc_triggered_capture(self):
-        """Actual-mode: PLC-initiated capture (runs on main thread)."""
+        """Actual-mode: PLC-initiated capture (runs on main thread).
+
+        Flow:
+          1. User presses 'Send HIGH'  →  app writes signal_coil HIGH to PLC.
+          2. PLC processes the signal, then writes trigger_coil HIGH.
+          3. Poll thread detects trigger_coil, clears it, resets signal_coil,
+             and fires on_trigger()  →  this method is called on main thread.
+          4. Current live frame is captured and sent through solder inference.
+          5. Result (PASS/NG) is written back to PLC via pass_coil / ng_coil.
+        """
         if not self.camera.is_running:
             return
-        # Re-use the same timed-capture logic
-        if self._cycle_phase in ("countdown",):
-            # Interrupt countdown and capture immediately
-            self._stop_capture_cycle()
-            self._cycle_phase = "capturing"
-            self._do_capture()
-        elif self._cycle_phase == "idle":
-            self._do_capture()
+        if self._cycle_phase in ("capturing", "result"):
+            # Already busy — ignore duplicate triggers
+            return
+        # Reset button label
+        self.send_high_btn.itemconfig(
+            self.send_high_btn._text_id, text="⚡  Send HIGH")
+        print("[PLC] Trigger received — starting solder inspection capture")
+        self._stop_capture_cycle()
+        self._cycle_phase = "capturing"
+        self.model_status_label.configure(
+            text="● PLC Triggered — Capturing...", fg=Colors.PRIMARY)
+        self._do_capture()
 
     def _write_plc_result(self, is_pass: bool):
         """Write result to PLC (actual mode only, non-blocking)."""
