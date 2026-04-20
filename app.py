@@ -1086,7 +1086,7 @@ class InFacApp(tk.Tk):
             old.destroy()
 
         self.log_canvas.update_idletasks()
-        self.log_canvas.yview_moveto(1.0)
+        self.log_canvas.yview_moveto(0.0)
 
     # ═════════════════════════════════════════════════════
     #  HELPERS
