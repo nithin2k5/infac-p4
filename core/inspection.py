@@ -54,15 +54,14 @@ class InspectionManager:
         
         if solder_count >= 2:
             status_text = "✅ PASS"
-            detail = f"{timestamp}  •  {solder_count} solder(s)  •  {filename}"
-            color = "#28a745" # Colors.SUCCESS equivalent
-            conf_str = f"{max_conf:.0%}" if solder_preds else "--"
+            detail = f"{timestamp}  •  {solder_count}/2 solders"
+            color = "#28a745"
+            conf_str = f"{solder_count}/2"
         else:
             self.total_defects += 1
             status_text = "❌ NG"
-            missing = 2 - solder_count
-            detail = f"{timestamp}  •  {missing} solder(s) missing  •  {filename}"
-            color = "#dc3545" # Colors.DANGER
+            detail = f"{timestamp}  •  {solder_count}/2 solders found"
+            color = "#dc3545"
             conf_str = f"{solder_count}/2"
 
         for pred in solder_preds:
@@ -134,14 +133,13 @@ class InspectionManager:
 
         if max_solder_count >= 2:
             status_text = "✅ PASS"
-            detail = f"{timestamp}  •  {max_solder_count} solder(s)  •  Auto"
+            detail = f"{timestamp}  •  {max_solder_count}/2 solders"
             color = "#28a745"
-            conf_str = f"{max_conf:.0%}" if solder_preds else "--"
+            conf_str = f"{max_solder_count}/2"
         else:
             self.total_defects += 1
             status_text = "❌ NG"
-            missing = 2 - max_solder_count
-            detail = f"{timestamp}  •  {missing} solder(s) missing  •  Auto"
+            detail = f"{timestamp}  •  {max_solder_count}/2 solders found"
             color = "#dc3545"
             conf_str = f"{max_solder_count}/2"
 
