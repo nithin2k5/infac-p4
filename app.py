@@ -19,6 +19,7 @@ import subprocess
 from core.camera import CameraManager
 from core.inference import InferenceEngine
 from core.inspection import InspectionManager
+from core.plc import PLCManager
 from PIL import Image, ImageTk
 from datetime import datetime
 from ui.theme import Colors, Fonts, Dimensions, configure_styles
@@ -63,9 +64,15 @@ class InFacApp(tk.Tk):
         self.camera = CameraManager()
         self.inference = InferenceEngine()
         self.inspection = InspectionManager()
-        
+        self.plc = PLCManager()
+
         self.inspection.on_log_result = self._add_log_entry
         self.inspection.on_stats_update = self._update_stats_ui
+
+        # PLC callbacks
+        self.plc.on_connect = self._on_plc_connected
+        self.plc.on_disconnect = self._on_plc_disconnected
+        self.plc.on_trigger = self._on_plc_trigger
 
         self.is_detecting = False        # used only for video-file playback
         self.current_detections = []
@@ -81,6 +88,9 @@ class InFacApp(tk.Tk):
         self._countdown_remaining = 0
         self._countdown_job = None
         self._result_frame = None        # annotated BGR frame shown during result phase
+
+        # Mode: "simulation" | "actual"
+        self._mode = "simulation"
 
         threading.Thread(target=self.inference.load_model, daemon=True).start()
 
@@ -255,10 +265,84 @@ class InFacApp(tk.Tk):
     def _build_right_panel(self, parent):
         """Right sidebar with settings and detection log."""
 
-        # ── Detection Settings ───────────────────────────
+        # ── Mode Selector ────────────────────────────────
         tk.Label(parent, text="⚙️  Detection Settings", font=Fonts.SUBHEADING,
                  bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY).pack(
-            anchor="w", padx=16, pady=(16, 12))
+            anchor="w", padx=16, pady=(16, 8))
+
+        mode_outer = tk.Frame(parent, bg=Colors.BG_CARD)
+        mode_outer.pack(fill="x", padx=16, pady=(0, 10))
+        tk.Label(mode_outer, text="Mode", font=Fonts.SMALL_BOLD,
+                 bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
+
+        mode_row = tk.Frame(mode_outer, bg=Colors.BG_MEDIUM, bd=1, relief="ridge")
+        mode_row.pack(fill="x")
+
+        self._sim_btn = tk.Label(mode_row, text="  Simulation  ", font=Fonts.SMALL_BOLD,
+                                  bg=Colors.PRIMARY, fg=Colors.BG_DARKEST,
+                                  cursor="hand2", padx=4, pady=5)
+        self._sim_btn.pack(side="left", fill="x", expand=True)
+        self._sim_btn.bind("<Button-1>", lambda e: self._set_mode("simulation"))
+
+        self._act_btn = tk.Label(mode_row, text="  Actual Model  ", font=Fonts.SMALL_BOLD,
+                                  bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED,
+                                  cursor="hand2", padx=4, pady=5)
+        self._act_btn.pack(side="left", fill="x", expand=True)
+        self._act_btn.bind("<Button-1>", lambda e: self._set_mode("actual"))
+
+        # ── PLC Settings (Actual mode only) ──────────────
+        self._plc_frame = tk.Frame(parent, bg=Colors.BG_CARD)
+        # (packed/unpacked dynamically when mode changes)
+
+        # PLC header
+        plc_hdr = tk.Frame(self._plc_frame, bg=Colors.BG_CARD)
+        plc_hdr.pack(fill="x")
+        tk.Label(plc_hdr, text="🔌  Delta PLC", font=Fonts.SMALL_BOLD,
+                 bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY).pack(side="left")
+        self._plc_status_label = tk.Label(plc_hdr, text="● Disconnected",
+                                           font=Fonts.TINY, bg=Colors.BG_CARD,
+                                           fg=Colors.DANGER)
+        self._plc_status_label.pack(side="right")
+
+        # IP + Port row
+        ip_row = tk.Frame(self._plc_frame, bg=Colors.BG_CARD)
+        ip_row.pack(fill="x", pady=(6, 2))
+        tk.Label(ip_row, text="IP", font=Fonts.TINY, bg=Colors.BG_CARD,
+                 fg=Colors.TEXT_MUTED, width=4, anchor="w").pack(side="left")
+        self._plc_ip_var = tk.StringVar(value="192.168.1.1")
+        tk.Entry(ip_row, textvariable=self._plc_ip_var, font=Fonts.SMALL,
+                 bg=Colors.BG_MEDIUM, fg=Colors.TEXT_PRIMARY,
+                 insertbackground=Colors.TEXT_PRIMARY, relief="flat",
+                 bd=4).pack(side="left", fill="x", expand=True, padx=(4, 6))
+        tk.Label(ip_row, text="Port", font=Fonts.TINY, bg=Colors.BG_CARD,
+                 fg=Colors.TEXT_MUTED).pack(side="left")
+        self._plc_port_var = tk.StringVar(value="502")
+        tk.Entry(ip_row, textvariable=self._plc_port_var, font=Fonts.SMALL,
+                 bg=Colors.BG_MEDIUM, fg=Colors.TEXT_PRIMARY,
+                 insertbackground=Colors.TEXT_PRIMARY, relief="flat",
+                 bd=4, width=5).pack(side="left", padx=(4, 0))
+
+        # Coil address row
+        coil_row = tk.Frame(self._plc_frame, bg=Colors.BG_CARD)
+        coil_row.pack(fill="x", pady=(2, 4))
+        for lbl, attr in [("Trig M", "_plc_trig_var"), ("Pass M", "_plc_pass_var"), ("NG M", "_plc_ng_var")]:
+            default = str({"_plc_trig_var": 0, "_plc_pass_var": 1, "_plc_ng_var": 2}[attr])
+            setattr(self, attr, tk.StringVar(value=default))
+            tk.Label(coil_row, text=lbl, font=Fonts.TINY, bg=Colors.BG_CARD,
+                     fg=Colors.TEXT_MUTED).pack(side="left", padx=(0, 2))
+            tk.Entry(coil_row, textvariable=getattr(self, attr), font=Fonts.SMALL,
+                     bg=Colors.BG_MEDIUM, fg=Colors.TEXT_PRIMARY,
+                     insertbackground=Colors.TEXT_PRIMARY, relief="flat",
+                     bd=4, width=4).pack(side="left", padx=(0, 6))
+
+        # Connect / Disconnect button
+        self._plc_connect_btn = StyledButton(
+            self._plc_frame, text="Connect PLC", bg_color=Colors.SUCCESS_DIM,
+            hover_color=Colors.SUCCESS, width=130, height=32,
+            command=self._toggle_plc_connection, font=Fonts.SMALL_BOLD)
+        self._plc_connect_btn.pack(pady=(2, 0))
+
+        tk.Frame(parent, bg=Colors.BORDER, height=1).pack(fill="x", padx=16, pady=(8, 0))
 
         # Confidence threshold
         thresh_frame = tk.Frame(parent, bg=Colors.BG_CARD)
@@ -701,6 +785,9 @@ class InFacApp(tk.Tk):
             self._play_alarm_sound()
             self.model_status_label.configure(text="● NG — Defect Detected", fg=Colors.DANGER)
 
+        # Write result to PLC in actual mode
+        self._write_plc_result(is_pass)
+
         # Show result for 3 seconds, then start next cycle
         self._countdown_job = self.after(3000, self._start_countdown)
 
@@ -935,7 +1022,8 @@ class InFacApp(tk.Tk):
     def _on_test_result(self, frame, predictions):
         self._static_predictions = predictions
         self._display_static_frame(frame.copy(), predictions)
-        self.inspection.process_test_snapshot(predictions, "Test snapshot")
+        is_pass = self.inspection.process_test_snapshot(predictions, "Test snapshot")
+        self._write_plc_result(is_pass)
 
     def _reset_stats(self):
         self.inspection.reset_stats()
@@ -1105,8 +1193,130 @@ class InFacApp(tk.Tk):
 
         _tick()
 
+    # ═════════════════════════════════════════════════════
+    #  MODE SWITCHING
+    # ═════════════════════════════════════════════════════
+
+    def _set_mode(self, mode: str):
+        """Switch between 'simulation' and 'actual' modes."""
+        if mode == self._mode:
+            return
+        self._mode = mode
+        if mode == "simulation":
+            self._sim_btn.configure(bg=Colors.PRIMARY, fg=Colors.BG_DARKEST)
+            self._act_btn.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+            self._plc_frame.pack_forget()
+            if self.plc.is_connected:
+                threading.Thread(target=self.plc.disconnect, daemon=True).start()
+        else:
+            self._sim_btn.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
+            self._act_btn.configure(bg=Colors.PRIMARY, fg=Colors.BG_DARKEST)
+            # Insert before the first BORDER-coloured separator in the right panel
+            children = list(self._plc_frame.master.winfo_children())
+            sep = next(
+                (w for w in children
+                 if isinstance(w, tk.Frame) and w.cget("bg") == Colors.BORDER),
+                None
+            )
+            if sep:
+                self._plc_frame.pack(fill="x", padx=16, pady=(0, 4), before=sep)
+            else:
+                self._plc_frame.pack(fill="x", padx=16, pady=(0, 4))
+
+    # ═════════════════════════════════════════════════════
+    #  PLC CONNECTION
+    # ═════════════════════════════════════════════════════
+
+    def _toggle_plc_connection(self):
+        if self.plc.is_connected:
+            self.plc.stop_trigger_poll()
+            threading.Thread(target=self._do_plc_disconnect, daemon=True).start()
+        else:
+            self._do_plc_connect_async()
+
+    def _do_plc_connect_async(self):
+        self._plc_status_label.configure(text="● Connecting...", fg=Colors.WARNING)
+        self._plc_connect_btn.itemconfig(self._plc_connect_btn._text_id, text="Connecting...")
+
+        def _bg():
+            try:
+                host = self._plc_ip_var.get().strip()
+                port = int(self._plc_port_var.get().strip() or "502")
+                self.plc.trigger_coil = int(self._plc_trig_var.get() or "0")
+                self.plc.pass_coil    = int(self._plc_pass_var.get() or "1")
+                self.plc.ng_coil      = int(self._plc_ng_var.get() or "2")
+                ok = self.plc.connect(host, port)
+                if not ok:
+                    self.after(0, self._on_plc_connect_failed)
+            except Exception as e:
+                print(f"[PLC] connection setup error: {e}")
+                self.after(0, self._on_plc_connect_failed)
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _do_plc_disconnect(self):
+        self.plc.disconnect()
+
+    def _on_plc_connected(self):
+        self.after(0, self.__plc_connected_ui)
+
+    def __plc_connected_ui(self):
+        self._plc_status_label.configure(text="● Connected", fg=Colors.SUCCESS)
+        self._plc_connect_btn.itemconfig(self._plc_connect_btn._text_id, text="Disconnect PLC")
+        self._plc_connect_btn.bg_color = Colors.DANGER_DIM
+        self._plc_connect_btn.hover_color = Colors.DANGER
+        self._plc_connect_btn.itemconfig(self._plc_connect_btn._bg_id, fill=Colors.DANGER_DIM)
+        # Start polling for PLC trigger
+        self.plc.start_trigger_poll()
+
+    def _on_plc_connect_failed(self):
+        self._plc_status_label.configure(text="● Failed", fg=Colors.DANGER)
+        self._plc_connect_btn.itemconfig(self._plc_connect_btn._text_id, text="Connect PLC")
+        self._plc_connect_btn.bg_color = Colors.SUCCESS_DIM
+        self._plc_connect_btn.hover_color = Colors.SUCCESS
+        self._plc_connect_btn.itemconfig(self._plc_connect_btn._bg_id, fill=Colors.SUCCESS_DIM)
+
+    def _on_plc_disconnected(self):
+        self.after(0, self.__plc_disconnected_ui)
+
+    def __plc_disconnected_ui(self):
+        self._plc_status_label.configure(text="● Disconnected", fg=Colors.DANGER)
+        self._plc_connect_btn.itemconfig(self._plc_connect_btn._text_id, text="Connect PLC")
+        self._plc_connect_btn.bg_color = Colors.SUCCESS_DIM
+        self._plc_connect_btn.hover_color = Colors.SUCCESS
+        self._plc_connect_btn.itemconfig(self._plc_connect_btn._bg_id, fill=Colors.SUCCESS_DIM)
+
+    def _on_plc_trigger(self):
+        """Called from PLC poll thread when trigger coil fires — run capture on main thread."""
+        self.after(0, self._plc_triggered_capture)
+
+    def _plc_triggered_capture(self):
+        """Actual-mode: PLC-initiated capture (runs on main thread)."""
+        if not self.camera.is_running:
+            return
+        # Re-use the same timed-capture logic
+        if self._cycle_phase in ("countdown",):
+            # Interrupt countdown and capture immediately
+            self._stop_capture_cycle()
+            self._cycle_phase = "capturing"
+            self._do_capture()
+        elif self._cycle_phase == "idle":
+            self._do_capture()
+
+    def _write_plc_result(self, is_pass: bool):
+        """Write result to PLC (actual mode only, non-blocking)."""
+        if self._mode != "actual" or not self.plc.is_connected:
+            return
+        threading.Thread(target=self.plc.write_result, args=(is_pass,), daemon=True).start()
+
+    # ═════════════════════════════════════════════════════
+    #  APP CLOSE
+    # ═════════════════════════════════════════════════════
+
     def _on_close(self):
         self._stop_glow()
         self.camera.is_running = False
         self.camera.stop()
+        if self.plc.is_connected:
+            self.plc.disconnect()
         self.destroy()
