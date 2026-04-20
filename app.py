@@ -382,22 +382,6 @@ class InFacApp(tk.Tk):
         self.cam_combo.set("Camera 0")
         self.cam_combo.pack(fill="x", pady=(4, 0))
 
-        # Capture Delay slider
-        cap_frame = tk.Frame(parent, bg=Colors.BG_CARD)
-        cap_frame.pack(fill="x", padx=16, pady=(4, 8))
-        cap_top = tk.Frame(cap_frame, bg=Colors.BG_CARD)
-        cap_top.pack(fill="x")
-        tk.Label(cap_top, text="Capture Delay (s)", font=Fonts.SMALL_BOLD,
-                 bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY).pack(side="left")
-        self.capture_delay_var = tk.IntVar(value=3)
-        self.capture_delay_display = tk.Label(cap_top, text="3s", font=Fonts.MONO_SMALL,
-                                               bg=Colors.BG_CARD, fg=Colors.PRIMARY)
-        self.capture_delay_display.pack(side="right")
-        ttk.Scale(cap_frame, from_=1, to=10, variable=self.capture_delay_var,
-                  orient="horizontal",
-                  command=lambda v: self.capture_delay_display.configure(
-                      text=f"{int(float(v))}s")).pack(fill="x", pady=(4, 0))
-        
         # ROI Crop slider (Vertical height crop)
         roi_frame = tk.Frame(parent, bg=Colors.BG_CARD)
         roi_frame.pack(fill="x", padx=16, pady=(0, 8))
@@ -695,13 +679,10 @@ class InFacApp(tk.Tk):
     # ═════════════════════════════════════════════════════
 
     def _start_countdown(self):
-        """Begin a fresh countdown before the next auto-capture."""
+        """Begin a new capture cycle — fires immediately (no countdown delay)."""
         self._stop_capture_cycle()
-        delay = int(self.capture_delay_var.get())
-        self._countdown_remaining = delay
-        self._cycle_phase = "countdown"
-        self.model_status_label.configure(
-            text=f"● Capturing in {delay}s...", fg=Colors.WARNING)
+        self._cycle_phase = "capturing"
+        self.model_status_label.configure(text="● Capturing...", fg=Colors.WARNING)
         # Reset indicators to idle before next shot
         self._stop_glow()
         self._last_result_state = None
@@ -709,7 +690,7 @@ class InFacApp(tk.Tk):
         self.pass_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
         self.ng_frame.configure(bg=Colors.BG_MEDIUM)
         self.ng_label.configure(bg=Colors.BG_MEDIUM, fg=Colors.TEXT_MUTED)
-        self._tick_countdown()
+        self._do_capture()
 
     def _tick_countdown(self):
         if not self.camera.is_running or self._cycle_phase != "countdown":
