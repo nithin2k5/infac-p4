@@ -1,5 +1,5 @@
 """
-InFac P4 — Industrial Inspection System
+Infac P4 — Industrial Inspection System
 Single-page live camera detection application using OpenCV + Tkinter + Roboflow.
 """
 
@@ -32,7 +32,7 @@ from ui.components import StyledButton, ToggleSwitch
 
 
 
-class InFacApp(tk.Tk):
+class InfacApp(tk.Tk):
     """Single-page industrial inspection application with live camera feed."""
 
     def __init__(self):
@@ -40,7 +40,7 @@ class InFacApp(tk.Tk):
         super().__init__()
 
         # ── Window Setup ─────────────────────────────────
-        self.title("InFac P4 — Industrial Inspection System")
+        self.title("Infac P4 — Industrial Inspection System")
         self.configure(bg=Colors.BG_DARKEST)
         self.minsize(1200, 750)
 
@@ -117,7 +117,7 @@ class InFacApp(tk.Tk):
         brand.pack(side="left", padx=20)
         tk.Label(brand, text="🏭", font=("Segoe UI", 18),
                  bg=Colors.BG_DARKEST, fg=Colors.PRIMARY).pack(side="left", padx=(0, 10))
-        tk.Label(brand, text="InFac P4", font=("Segoe UI", 14, "bold"),
+        tk.Label(brand, text="Infac P4", font=("Segoe UI", 14, "bold"),
                  bg=Colors.BG_DARKEST, fg=Colors.TEXT_PRIMARY).pack(side="left")
         tk.Label(brand, text="Industrial Inspection System", font=Fonts.SMALL,
                  bg=Colors.BG_DARKEST, fg=Colors.TEXT_MUTED).pack(side="left", padx=(12, 0))
@@ -458,8 +458,10 @@ class InFacApp(tk.Tk):
             self.start_btn.itemconfig(self.start_btn._bg_id, fill=Colors.DANGER_DIM)
             self.camera_canvas.unbind("<Configure>")
             self.camera.is_paused = False
+            self._cycle_phase = "idle"
+            self.model_status_label.configure(
+                text="● Camera ready — press Test to inspect", fg=Colors.TEXT_MUTED)
             self._update_frame()
-            self._start_countdown()
         elif self.camera.is_running:
             self._stop_camera()
         else:
@@ -500,12 +502,13 @@ class InFacApp(tk.Tk):
         self._inference_busy = False
 
         self._update_frame()
-        if self._mode != "actual":
-            self._start_countdown()
-        else:
-            self._cycle_phase = "idle"
+        self._cycle_phase = "idle"
+        if self._mode == "actual":
             self.model_status_label.configure(
                 text="● Ready — press 'Send HIGH' to signal PLC", fg=Colors.TEXT_MUTED)
+        else:
+            self.model_status_label.configure(
+                text="● Camera ready — press Test to inspect", fg=Colors.TEXT_MUTED)
 
     def _stop_camera(self):
         self._stop_capture_cycle()

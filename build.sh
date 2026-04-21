@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  InFac P4 — Windows EXE Build Script
+#  Infac P4 — Windows EXE Build Script
 #  Run this on Windows via Git Bash or WSL.
 #  PyInstaller must execute on Windows to produce a .exe.
 # ============================================================
@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "============================================================"
-echo " InFac P4 - Windows Build"
+echo " Infac P4 - Windows Build"
 echo "============================================================"
 echo ""
 
@@ -68,30 +68,30 @@ echo "[INFO] PyInstaller: $(pyinstaller --version)"
 
 # ── Clean previous build artefacts ──────────────────────────
 echo "[INFO] Cleaning previous build..."
-rm -rf build/InFacP4
-rm -f  dist/InFacP4.exe
+rm -rf build/InfacP4
+rm -f  dist/InfacP4.exe
 
 # ── Run PyInstaller ──────────────────────────────────────────
 echo ""
-echo "[INFO] Building InFacP4.exe — this may take a few minutes..."
+echo "[INFO] Building InfacP4.exe — this may take a few minutes..."
 echo ""
 
 pyinstaller main.spec --clean --noconfirm
 
 # ── Verify output ────────────────────────────────────────────
-if [ -f "dist/InFacP4.exe" ]; then
-    SIZE=$(du -sh dist/InFacP4.exe | cut -f1)
+if [ -f "dist/InfacP4.exe" ]; then
+    SIZE=$(du -sh dist/InfacP4.exe | cut -f1)
     echo ""
     echo "============================================================"
     echo " Build complete!"
-    echo " Output : dist/InFacP4.exe  ($SIZE)"
+    echo " Output : dist/InfacP4.exe  ($SIZE)"
     echo "============================================================"
     echo ""
     echo "NOTE: First launch on Windows may take 5-15 seconds while"
     echo "      the app extracts itself to a temporary directory."
 else
     echo ""
-    echo "[ERROR] Build failed — dist/InFacP4.exe not found."
+    echo "[ERROR] Build failed — dist/InfacP4.exe not found."
     echo "        Check the PyInstaller output above for details."
     exit 1
 fi

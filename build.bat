@@ -2,7 +2,7 @@
 setlocal
 
 echo ============================================================
-echo  InFac P4 - Windows Build
+echo  Infac P4 - Windows Build
 echo ============================================================
 echo.
 
@@ -40,11 +40,11 @@ if %errorlevel% neq 0 (
 
 :: ── Clean previous build artefacts ───────────────────────────
 echo [INFO] Cleaning previous build...
-if exist "dist\InFacP4.exe" del /f /q "dist\InFacP4.exe"
-if exist "build\InFacP4" rd /s /q "build\InFacP4"
+if exist "dist\InfacP4.exe" del /f /q "dist\InfacP4.exe"
+if exist "build\InfacP4" rd /s /q "build\InfacP4"
 
 :: ── Run PyInstaller ──────────────────────────────────────────
-echo [INFO] Building InFacP4.exe — this may take a few minutes...
+echo [INFO] Building InfacP4.exe — this may take a few minutes...
 echo.
 pyinstaller main.spec --clean --noconfirm
 if %errorlevel% neq 0 (
@@ -57,7 +57,7 @@ if %errorlevel% neq 0 (
 :: ── Done ─────────────────────────────────────────────────────
 echo.
 echo ============================================================
-echo  Build complete!  dist\InFacP4.exe is ready.
+echo  Build complete!  dist\InfacP4.exe is ready.
 echo ============================================================
 echo.
 echo NOTE: First launch may take 5-15 seconds while Windows

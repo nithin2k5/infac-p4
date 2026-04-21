@@ -1,5 +1,5 @@
 """
-InFac P4 — Industrial Inspection System
+Infac P4 — Industrial Inspection System
 Entry point for the desktop application.
 
 Requirements:
@@ -41,8 +41,8 @@ def check_dependencies():
 
 def main():
     check_dependencies()
-    from app import InFacApp
-    app = InFacApp()
+    from app import InfacApp
+    app = InfacApp()
     app.mainloop()
 
 

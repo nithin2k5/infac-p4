@@ -77,7 +77,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='InFacP4',
+    name='InfacP4',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

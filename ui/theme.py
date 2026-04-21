@@ -1,5 +1,5 @@
 """
-InFac P4 — Centralized Theme System
+Infac P4 — Centralized Theme System
 Dark industrial theme with blue accent colors.
 """
 

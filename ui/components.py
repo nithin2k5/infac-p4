@@ -1,5 +1,5 @@
 """
-InFac P4 — Reusable UI Components
+Infac P4 — Reusable UI Components
 Custom widgets for the industrial inspection application.
 """
 

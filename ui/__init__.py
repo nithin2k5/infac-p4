@@ -1,1 +1,1 @@
-# InFac P4 - UI Components Package
+# Infac P4 - UI Components Package
