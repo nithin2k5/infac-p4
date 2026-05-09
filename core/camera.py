@@ -20,14 +20,15 @@ class CameraManager:
         self.filename = ""
         
     def start_camera(self, cam_idx, on_success, on_fail):
-        """Open camera in a background thread."""
+        """Open camera on the calling (main) thread, then spin capture loop.
+
+        On macOS, cv2.VideoCapture uses AVFoundation which requires the main
+        thread.  We therefore open the capture handle here synchronously and
+        only move the *reading* loop to a daemon thread.
+        """
         self.filename = f"Camera {cam_idx}"
         self.is_video_file = False
-        thread = threading.Thread(
-            target=self._open_camera_thread, args=(cam_idx, on_success, on_fail), daemon=True)
-        thread.start()
 
-    def _open_camera_thread(self, cam_idx, on_success, on_fail):
         if platform.system() == "Windows":
             cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
         else:
@@ -38,22 +39,23 @@ class CameraManager:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not cap.isOpened():
+            cap.release()
             on_fail()
             return
 
-        cap.read() # Pre-read
+        cap.read()  # Pre-read / warm-up
         self.cap = cap
         self.is_running = True
         self.is_paused = False
-        
+
         # Reset stats
         self.fps_frame_count = 0
         self.last_fps_time = time.time()
         self.frame_count = 0
-        
+
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.capture_thread.start()
-        
+
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         on_success(width, height)
