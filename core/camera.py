@@ -34,9 +34,10 @@ class CameraManager:
         else:
             cap = cv2.VideoCapture(cam_idx)
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 416)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 416)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FPS, 30)
 
         if not cap.isOpened():
             cap.release()
