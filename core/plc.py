@@ -51,6 +51,11 @@ class PLCManager:
         self._poll_thread = None
         self._stop_poll = threading.Event()
 
+        # Debounce gate — prevents a re-read trigger coil from double-firing
+        # during the Modbus acknowledgement round-trip.  Armed (set) = ready.
+        self._trigger_debounce = threading.Event()
+        self._trigger_debounce.set()
+
         # Callbacks
         self.on_trigger    = None   # () — called when PLC trigger fires
         self.on_connect    = None   # () — called on successful connect
@@ -81,6 +86,7 @@ class PLCManager:
 
     def disconnect(self):
         self._stop_poll.set()
+        self._trigger_debounce.set()  # release gate so poll thread can exit cleanly
         if self._poll_thread and self._poll_thread.is_alive():
             self._poll_thread.join(timeout=2)
         if self.client:
@@ -167,13 +173,24 @@ class PLCManager:
             try:
                 result = self.client.read_coils(self.trigger_coil, count=1)
                 if result and not result.isError() and result.bits[0]:
-                    # Acknowledge by clearing the trigger coil
-                    self.client.write_coil(self.trigger_coil, False)
-                    # Also reset the signal coil — PLC has acknowledged
-                    self.send_signal_low()
-                    print("[PLC] Trigger coil fired — requesting capture")
-                    if self.on_trigger:
-                        self.on_trigger()
+                    if self._trigger_debounce.is_set():
+                        # Disarm gate immediately — prevents re-read double-fire
+                        self._trigger_debounce.clear()
+                        # Acknowledge: clear trigger coil then reset signal coil
+                        self.client.write_coil(self.trigger_coil, False)
+                        self.send_signal_low()
+                        print("[PLC] Trigger coil fired — requesting capture")
+                        if self.on_trigger:
+                            self.on_trigger()
+                        # Re-arm after 500 ms debounce window
+                        threading.Timer(0.5, self._trigger_debounce.set).start()
+                    else:
+                        # Duplicate trigger within debounce window — just clear coil
+                        print("[PLC] Duplicate trigger ignored (debounce active)")
+                        try:
+                            self.client.write_coil(self.trigger_coil, False)
+                        except Exception:
+                            pass
             except Exception as e:
                 print(f"[PLC] poll error: {e}")
                 self._handle_comm_error()

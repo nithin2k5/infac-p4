@@ -92,6 +92,12 @@ class InfacApp(tk.Tk):
         # Mode: "simulation" | "actual"
         self._mode = "simulation"
 
+        # Frame safety & watchdog
+        self.current_frame = None            # always initialised; avoids hasattr checks
+        self._frame_lock = threading.Lock()  # guards current_frame across reads/writes
+        self._last_frame_time = 0.0          # updated every time a real frame arrives
+        self._watchdog_job = None            # after() handle for the watchdog loop
+
         threading.Thread(target=self.inference.load_model, daemon=True).start()
 
         # ── Build UI ─────────────────────────────────────
@@ -368,7 +374,7 @@ class InfacApp(tk.Tk):
         self.conf_display.pack(side="right")
 
         self.conf_var = tk.DoubleVar(value=0.65)
-        ttk.Scale(thresh_frame, from_=0.1, to=1.0, variable=self.conf_var,
+        ttk.Scale(thresh_frame, from_=0.5, to=1.0, variable=self.conf_var,
                   orient="horizontal",
                   command=self._on_threshold_change).pack(fill="x", pady=(4, 0))
 
@@ -503,6 +509,7 @@ class InfacApp(tk.Tk):
 
         self._update_frame()
         self._cycle_phase = "idle"
+        self._start_watchdog()   # begin frame-rate watchdog
         if self._mode == "actual":
             self.model_status_label.configure(
                 text="● Ready — press 'Send HIGH' to signal PLC", fg=Colors.TEXT_MUTED)
@@ -512,6 +519,7 @@ class InfacApp(tk.Tk):
 
     def _stop_camera(self):
         self._stop_capture_cycle()
+        self._stop_watchdog()        # cancel watchdog before killing the camera
         self.camera.is_running = False
         self.is_detecting = False
         self.camera.stop()
@@ -554,7 +562,9 @@ class InfacApp(tk.Tk):
                 self.after(10, self._update_frame)
             return
 
-        self.current_frame = frame.copy()
+        with self._frame_lock:
+            self.current_frame = frame.copy()
+        self._last_frame_time = time.time()   # heartbeat for watchdog
 
         self.fps_label.configure(text=f"FPS: {self.camera.fps:.1f}")
         self.stat_labels["fps_stat_val"].configure(text=f"{self.camera.fps:.0f}")
@@ -717,7 +727,8 @@ class InfacApp(tk.Tk):
         self._cycle_phase = "capturing"
         self.model_status_label.configure(text="● Capturing...", fg=Colors.PRIMARY)
 
-        captured = self.current_frame.copy()
+        with self._frame_lock:
+            captured = self.current_frame.copy()
         h_img, w_img = captured.shape[:2]
         roi_scale = self.roi_var.get()
         roi = None if roi_scale >= 0.99 else (
@@ -974,10 +985,10 @@ class InfacApp(tk.Tk):
         self._show_frame_on_canvas(frame)
 
     def _test_detect(self):
-        if self.current_frame is None:
-            return
-
-        frame = self.current_frame.copy()
+        with self._frame_lock:
+            if self.current_frame is None:
+                return
+            frame = self.current_frame.copy()
 
         if self.camera.is_running:
             # Stop capture cycle and pause camera
@@ -1096,8 +1107,12 @@ class InfacApp(tk.Tk):
     # ═════════════════════════════════════════════════════
 
     def _on_threshold_change(self, value):
-        pct = int(float(value) * 100)
-        self.confidence_threshold = float(value)
+        # Clamp: never allow below 50 % — prevents noise detections
+        val = max(0.5, float(value))
+        if abs(val - float(value)) > 0.001:   # slider drifted below floor
+            self.conf_var.set(val)
+        pct = int(val * 100)
+        self.confidence_threshold = val
         self.conf_display.configure(text=f"{pct}%")
 
     def _update_clock(self):
@@ -1152,6 +1167,52 @@ class InfacApp(tk.Tk):
         if self._glow_job is not None:
             self.after_cancel(self._glow_job)
             self._glow_job = None
+
+    # ═════════════════════════════════════════════════════
+    #  CAMERA WATCHDOG  (Point 7)
+    # ═════════════════════════════════════════════════════
+
+    def _start_watchdog(self):
+        """Start 1 Hz watchdog that detects a stalled camera feed."""
+        self._stop_watchdog()
+        self._last_frame_time = time.time()   # seed so first tick doesn't false-trigger
+        self._watchdog_job = self.after(1000, self._watchdog_check)
+
+    def _stop_watchdog(self):
+        """Cancel the watchdog loop."""
+        if self._watchdog_job is not None:
+            self.after_cancel(self._watchdog_job)
+            self._watchdog_job = None
+        self._last_frame_time = 0.0
+
+    def _watchdog_check(self):
+        """Runs every 1 s while camera is live.
+
+        If no frame has arrived for >2 s the feed is considered stalled:
+          • UI shows a prominent warning.
+          • In Actual mode with PLC connected, writes NG (safe-fail) so the
+            production line does not pass uninspected parts.
+        """
+        if not self.camera.is_running:
+            self._watchdog_job = None
+            return
+
+        if self._last_frame_time > 0:
+            elapsed = time.time() - self._last_frame_time
+            if elapsed > 2.0:
+                self.cam_status_label.configure(
+                    text="⚠️  Camera Stall!", fg=Colors.DANGER)
+                self.model_status_label.configure(
+                    text=f"● No frame for {elapsed:.0f}s — check camera",
+                    fg=Colors.DANGER)
+                # Safe-fail: assert NG on PLC so no uninspected part gets a PASS
+                if self._mode == "actual" and self.plc.is_connected:
+                    threading.Thread(
+                        target=lambda: self.plc.write_result(False),
+                        daemon=True
+                    ).start()
+
+        self._watchdog_job = self.after(1000, self._watchdog_check)
 
     def _start_pass_glow(self):
         """Pulse the PASS label with a green glow effect."""
