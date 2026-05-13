@@ -1,67 +1,71 @@
 import cv2
-import base64
-import requests
 import numpy as np
+import os
+import sys
 
 
 # ═════════════════════════════════════════════════════════
-#  ROBOFLOW HOSTED INFERENCE
+#  LOCAL YOLO INFERENCE  (weights-6.pt)
 # ═════════════════════════════════════════════════════════
 
-ROBOFLOW_API_KEY = "cf7X6JDorlmwhw6aqKUK"
-ROBOFLOW_MODEL = "p4-kbph4"
-ROBOFLOW_VERSION = "13"
-ROBOFLOW_URL = (
-    f"https://detect.roboflow.com/{ROBOFLOW_MODEL}/{ROBOFLOW_VERSION}"
-)
+def _resolve_weights_path(filename="weights-6.pt"):
+    """Locate weights file relative to the app bundle or source root."""
+    # PyInstaller bundle: files are next to the executable
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        # Source: two levels up from core/inference.py → project root
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, filename)
+
+
+WEIGHTS_PATH = _resolve_weights_path("weights-6.pt")
 
 
 class InferenceEngine:
-    """Inference engine using Roboflow hosted API."""
+    """Inference engine using local YOLOv8 weights (weights-6.pt)."""
 
     def __init__(self, model_path=None):
-        # model_path kept for API compatibility but unused with hosted inference
-        self.api_key = ROBOFLOW_API_KEY
-        self.api_url = ROBOFLOW_URL
+        self._model = None
         self._loaded = False
+        self._weights = model_path or WEIGHTS_PATH
+
+    # ─────────────────────────────────────────────────────
+    #  Model loading
+    # ─────────────────────────────────────────────────────
 
     def load_model(self):
-        """Verify API connectivity by sending a small test request."""
+        """Load YOLO model from weights-6.pt.  Safe to call from any thread."""
         try:
-            # Create a tiny test image to verify the API key works
-            test_img = np.zeros((64, 64, 3), dtype=np.uint8)
-            _, buf = cv2.imencode(".jpg", test_img)
-            img_b64 = base64.b64encode(buf).decode("utf-8")
-
-            resp = requests.post(
-                self.api_url,
-                params={
-                    "api_key": self.api_key,
-                    "confidence": 50,
-                },
-                data=img_b64,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                self._loaded = True
-                print("Roboflow API connected successfully.")
-                return True
-            else:
-                print(f"Roboflow API error: {resp.status_code} — {resp.text}")
+            from ultralytics import YOLO
+            if not os.path.exists(self._weights):
+                print(f"[InferenceEngine] Weights not found: {self._weights}")
                 self._loaded = False
                 return False
+
+            print(f"[InferenceEngine] Loading model: {self._weights}")
+            self._model = YOLO(self._weights)
+            # Warm-up pass so the first real inference is fast
+            dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+            self._model.predict(dummy, verbose=False, conf=0.5)
+            self._loaded = True
+            print("[InferenceEngine] Model loaded and warmed up ✓")
+            return True
         except Exception as e:
-            print(f"Roboflow API connection error: {e}")
+            print(f"[InferenceEngine] Failed to load model: {e}")
             self._loaded = False
             return False
 
     def is_loaded(self):
         return self._loaded
 
+    # ─────────────────────────────────────────────────────
+    #  Inference
+    # ─────────────────────────────────────────────────────
+
     def infer(self, frame, confidence_threshold=0.40, roi=None):
-        """Run inference via Roboflow hosted API."""
-        if not self._loaded:
+        """Run local YOLO inference and return predictions in unified format."""
+        if not self._loaded or self._model is None:
             return []
 
         # ROI cropping
@@ -78,41 +82,39 @@ class InferenceEngine:
             inference_frame = frame
             offset_x, offset_y = 0, 0
 
-        # Encode frame as JPEG → base64
-        _, buf = cv2.imencode(".jpg", inference_frame)
-        img_b64 = base64.b64encode(buf).decode("utf-8")
-
         try:
-            resp = requests.post(
-                self.api_url,
-                params={
-                    "api_key": self.api_key,
-                    "confidence": int(confidence_threshold * 100),
-                },
-                data=img_b64,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=10,
+            results = self._model.predict(
+                inference_frame,
+                conf=confidence_threshold,
+                verbose=False,
+                imgsz=640,
             )
-            if resp.status_code != 200:
-                print(f"Roboflow inference error: {resp.status_code}")
-                return []
-
-            data = resp.json()
         except Exception as e:
-            print(f"Roboflow inference request failed: {e}")
+            print(f"[InferenceEngine] Inference error: {e}")
             return []
 
-        # Parse Roboflow response → unified prediction format
         raw_predictions = []
-        for pred in data.get("predictions", []):
-            raw_predictions.append({
-                "x": float(pred["x"]) + offset_x,
-                "y": float(pred["y"]) + offset_y,
-                "width": float(pred["width"]),
-                "height": float(pred["height"]),
-                "class": pred["class"].lower(),
-                "confidence": float(pred["confidence"]),
-            })
+        if results and len(results) > 0:
+            result = results[0]
+            names = result.names  # {int: class_name}
+            boxes = result.boxes
+
+            if boxes is not None:
+                for box in boxes:
+                    cls_id = int(box.cls[0].item())
+                    conf   = float(box.conf[0].item())
+                    # box.xywh: center-x, center-y, width, height (in pixels)
+                    xywh = box.xywh[0].tolist()
+                    cx, cy, bw, bh = xywh
+
+                    raw_predictions.append({
+                        "x": cx + offset_x,
+                        "y": cy + offset_y,
+                        "width": bw,
+                        "height": bh,
+                        "class": names[cls_id].lower(),
+                        "confidence": conf,
+                    })
 
         return self.apply_nms(raw_predictions, iou_threshold=0.45)
 
