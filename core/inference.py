@@ -5,6 +5,58 @@ import numpy as np
 
 
 # ═════════════════════════════════════════════════════════
+#  LIGHTING-INVARIANT PREPROCESSING
+# ═════════════════════════════════════════════════════════
+
+# CLAHE instance — reused across frames (thread-safe for reads)
+_CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+_SHARPEN_KERNEL = np.array([[0, -1,  0],
+                             [-1,  5, -1],
+                             [0, -1,  0]], dtype=np.float32)
+
+
+def preprocess_frame(frame: np.ndarray) -> np.ndarray:
+    """Normalise a BGR frame so inference is robust to lighting variation.
+
+    Pipeline:
+      1. Auto white-balance  — equalise per-channel means so colour casts
+                               from warm/cool/mixed lighting are removed.
+      2. CLAHE on L channel  — boosts local contrast in dark *or* bright
+                               regions without blowing out highlights.
+      3. Unsharp mask        — sharpens solder-joint edges which are easily
+                               softened by JPEG / camera optics.
+    """
+    # ── 1. Simple auto white-balance (grey-world assumption) ─────────────
+    result = frame.astype(np.float32)
+    b_mean, g_mean, r_mean = (
+        result[:, :, 0].mean(),
+        result[:, :, 1].mean(),
+        result[:, :, 2].mean(),
+    )
+    global_mean = (b_mean + g_mean + r_mean) / 3.0
+    if b_mean > 0:
+        result[:, :, 0] *= global_mean / b_mean
+    if g_mean > 0:
+        result[:, :, 1] *= global_mean / g_mean
+    if r_mean > 0:
+        result[:, :, 2] *= global_mean / r_mean
+    result = np.clip(result, 0, 255).astype(np.uint8)
+
+    # ── 2. CLAHE on the L (luminance) channel of LAB ─────────────────────
+    lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l_eq = _CLAHE.apply(l)
+    lab_eq = cv2.merge([l_eq, a, b])
+    result = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
+
+    # ── 3. Unsharp mask (sharpen edges) ──────────────────────────────────
+    blurred = cv2.GaussianBlur(result, (0, 0), sigmaX=1.5)
+    result = cv2.addWeighted(result, 1.5, blurred, -0.5, 0)
+
+    return result
+
+
+# ═════════════════════════════════════════════════════════
 #  ROBOFLOW HOSTED INFERENCE
 # ═════════════════════════════════════════════════════════
 
@@ -78,8 +130,11 @@ class InferenceEngine:
             inference_frame = frame
             offset_x, offset_y = 0, 0
 
+        # Normalise lighting before encoding
+        inference_frame = preprocess_frame(inference_frame)
+
         # Encode frame as JPEG → base64
-        _, buf = cv2.imencode(".jpg", inference_frame)
+        _, buf = cv2.imencode(".jpg", inference_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
         img_b64 = base64.b64encode(buf).decode("utf-8")
 
         try:
