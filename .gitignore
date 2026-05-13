@@ -24,5 +24,4 @@ Desktop.ini
 
 # Local data / models (if any)
 models/
-*.pt
 *.onnx
