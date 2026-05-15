@@ -18,13 +18,15 @@ _SHARPEN_KERNEL = np.array([[0, -1,  0],
 def preprocess_frame(frame: np.ndarray) -> np.ndarray:
     """Normalise a BGR frame so inference is robust to lighting variation.
 
-    Pipeline:
-      1. Auto white-balance  — equalise per-channel means so colour casts
-                               from warm/cool/mixed lighting are removed.
-      2. CLAHE on L channel  — boosts local contrast in dark *or* bright
-                               regions without blowing out highlights.
-      3. Unsharp mask        — sharpens solder-joint edges which are easily
-                               softened by JPEG / camera optics.
+    NOTE: This function is kept for diagnostic / legacy use but is NOT called
+    during normal inference.  Proper cameras already produce well-balanced
+    frames and applying grey-world WB + CLAHE before sending to Roboflow
+    distorts the colour information the model was trained on, reducing accuracy.
+
+    Pipeline (if used manually):
+      1. Auto white-balance  — equalise per-channel means.
+      2. CLAHE on L channel  — boosts local contrast.
+      3. Unsharp mask        — sharpens edges.
     """
     # ── 1. Simple auto white-balance (grey-world assumption) ─────────────
     result = frame.astype(np.float32)
@@ -130,11 +132,10 @@ class InferenceEngine:
             inference_frame = frame
             offset_x, offset_y = 0, 0
 
-        # Normalise lighting before encoding
-        inference_frame = preprocess_frame(inference_frame)
-
         # Encode frame as JPEG → base64
-        _, buf = cv2.imencode(".jpg", inference_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        # Send the raw frame — the camera's own ISP already handles WB,
+        # sharpness, and exposure.  Avoid re-processing which distorts colour.
+        _, buf = cv2.imencode(".jpg", inference_frame, [cv2.IMWRITE_JPEG_QUALITY, 97])
         img_b64 = base64.b64encode(buf).decode("utf-8")
 
         try:

@@ -28,37 +28,25 @@ class CameraManager:
     def _configure_capture(cap):
         """Apply resolution and image-quality settings to an open capture.
 
-        12 MP USB cameras often produce blurry frames when forced to 1920×1080
-        because the driver uses lossy digital downscaling.  Setting 1280×720
-        matches a native sensor mode on most such cameras and gives sharp,
-        artefact-free frames at >30 fps.
-
-        Additional V4L2 / DirectShow properties reduce motion blur and improve
-        sharpness for industrial close-up inspection.
+        For proper/high-quality cameras, we request the full 1920×1080 native
+        resolution and let the camera's own ISP handle white-balance, focus,
+        and exposure.  Only the buffer size and codec are forced so we always
+        get the freshest frame without USB bandwidth issues.
         """
-        # ── Resolution: use a clean native sensor mode ───────────────────────
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
+        # ── Resolution: request full HD — camera driver will use best match ──
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         cap.set(cv2.CAP_PROP_FPS, 30)
 
         # ── Buffer: keep only the freshest frame ─────────────────────────────
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        # ── Sharpness / focus (supported on most UVC cameras) ────────────────
-        # Disable auto-focus so the lens doesn't hunt and blur mid-inspection
-        cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-        # Request maximum sharpness (range 0–255 on most drivers)
-        cap.set(cv2.CAP_PROP_SHARPNESS, 200)
+        # ── Focus: let the camera's autofocus work for sharpest results ──────
+        cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
 
-        # ── Exposure: manual mode prevents auto-brightness flicker ───────────
-        # 0.25 = manual exposure on V4L2 / DirectShow (driver-dependent)
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-        # A moderate exposure value; tweak if the scene is too dark/bright
-        cap.set(cv2.CAP_PROP_EXPOSURE, -6)
-
-        # ── Contrast / brightness ────────────────────────────────────────────
-        cap.set(cv2.CAP_PROP_BRIGHTNESS, 128)
-        cap.set(cv2.CAP_PROP_CONTRAST,   128)
+        # ── Exposure / WB: leave on AUTO so the camera ISP manages them ──────
+        # (Manual overrides hurt quality on cameras with good hardware ISPs)
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  # 0.75 = auto on V4L2
 
         # ── Codec: prefer MJPEG which avoids USB bandwidth issues ────────────
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -89,8 +77,9 @@ class CameraManager:
             on_fail()
             return
 
-        # Warm-up: discard the first few frames which can be dark/blurry
-        for _ in range(3):
+        # Warm-up: discard the first several frames so the camera ISP can
+        # settle its auto-exposure and auto-focus before we start using frames.
+        for _ in range(10):
             cap.read()
 
         self.cap = cap
