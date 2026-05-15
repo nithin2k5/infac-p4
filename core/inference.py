@@ -61,8 +61,8 @@ def preprocess_frame(frame: np.ndarray) -> np.ndarray:
 # ═════════════════════════════════════════════════════════
 
 ROBOFLOW_API_KEY = "cf7X6JDorlmwhw6aqKUK"
-ROBOFLOW_MODEL = "p4-kbph4"
-ROBOFLOW_VERSION = "13"
+ROBOFLOW_MODEL = "pcb-sated"
+ROBOFLOW_VERSION = "1"
 ROBOFLOW_URL = (
     f"https://detect.roboflow.com/{ROBOFLOW_MODEL}/{ROBOFLOW_VERSION}"
 )
